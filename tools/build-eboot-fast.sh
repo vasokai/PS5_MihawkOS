@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Incremental title rebuild. Reuses build/ps5, .deps and the staged runtime.
 # Does not configure Wine, RADV, Mesa or the runtime pack. A tree without
 # build/ps5/build.ninja has to be made once by tools/build-production.sh.
