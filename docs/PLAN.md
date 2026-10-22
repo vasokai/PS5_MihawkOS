@@ -1,5 +1,15 @@
 # Plan
 
+## Execute on direct memory was not patched (2026-10-22, no console run)
+
+The flexible pool is already at the kernel's cap, and executable copies still land there. A kernel write that would
+move those copies into the 11,712 MiB application pool, or raise the flexible budget at runtime, is not in this tree.
+The payload SDK can read and write kernel data, and kstuff's existing execute exception is already what lets JIT
+memory run. Neither one is a verified site for the clip that still strips execute from direct memory, and kernel text
+cannot be byte-checked. The unlocked vm_map write this tree already disabled races a live map. Hard hangs in that
+period were followed by two factory resets. [DMEM_EXEC.md](DMEM_EXEC.md) is the decision, the firmware words, and the
+rule for a later probe. No new eboot. Nothing to deploy.
+
 ## Raw system-memory spikes, and a prefix saved before SIGKILL (2026-10-22, no console run)
 
 The flexible-pressure guard below is unchanged. Beside it, the title samples the raw resident census about every 200 ms

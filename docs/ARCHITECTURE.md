@@ -144,6 +144,9 @@ the guard test deliberately uses it. A private anonymous mapping with no address
 in a helper whose application allocator is on, is given its own direct-memory
 region (`pw_wine_anon_fresh_direct`). Executable mappings stay on flexible memory:
 the kernel drops execute from direct memory, and code runs from JIT copies.
+A live kernel patch that would allow execute on the application pool, or raise
+the flexible budget past the kernel's 1 GiB cap, is not shipped.
+[DMEM_EXEC.md](DMEM_EXEC.md) records why, and the worst case of doing it anyway.
 Native modules, bootstrap, JIT copies and some shared transport still consume
 flexible memory, so the memory guard remains enabled. It is fed the resident
 census minus direct-memory growth since the start (`src/pw_memory_policy.h`),
