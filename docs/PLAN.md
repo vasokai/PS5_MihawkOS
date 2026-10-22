@@ -1,5 +1,26 @@
 # Plan
 
+## Raw system-memory spikes, and a prefix saved before SIGKILL (2026-10-22, no console run)
+
+The flexible-pressure guard below is unchanged. Beside it, the title samples the raw resident census about every 200 ms
+(`src/pw_system_pool.h`) and adds helper growth since the memory helper's half-second census. A steady figure under the
+firmware limit is left alone. A rise of 32 MiB while already at the warn line (1450 MiB on firmware 12), any rise within
+32 MiB of the 1600 MiB limit, or the limit itself, SIGSTOPs the helper that grew. If the figure is still at the limit
+250 ms later, that helper is SIGKILLed. The title and the memory helper are never signalled. The flight recorder warns
+at 2 s and ends the Windows helpers at 5 s when the session has presented a frame and then shows none, and either the
+title waits in `vmwait` or the raw census is already at the kill line. The 45 s hang breaker is unchanged. The title's
+compositor scratch is touched before the first frame (`prepare_workspace` in `src/pw_window_compose.c`).
+
+A cut-short session used to lose the prefix. The in-process wineserver never exits, so it does not save on its own.
+The title already asks it to (patch 0886) every 30 s and on the way back to the launcher, and the hive file is fsynced
+before the rename. That save used to run only after helper SIGKILL, inside `return_to_launcher`, so a freeze during the
+kill left the hive in memory, and the directory of the rename was not fsynced. `/data` is a nullfs over `/user/data`,
+bfs on `ssd0.user`, not mounted synchronous. Credential Manager is `user.reg`. crypt32 is unpatched, so a DPAPI master
+key is that hive and the files under `drive_c/users/Mihawk/AppData`. `native/proton_wine.cpp` now flushes the registry
+and fsyncs the prefix directory before SIGKILL, syncs file data before LoadExec, and starts that file sync in the
+background every 30 s. The same behaviour as `cursor/prefix-persist-f005` (`7f27cb3`), folded into this branch so one
+eboot carries both. Host tests `pw_system_pool`, `pw_hang_breaker`, `pw_memory_policy`. Not run on a console.
+
 ## Flexible pressure and anonymous direct memory (2026-10-22, no console run)
 
 A firmware 12.20 title log showed the resident census (the guard's old input) climb from 944 MiB to 1601 MiB in about

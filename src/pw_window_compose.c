@@ -68,6 +68,9 @@ static int reserve(PwWindowEffects *effects,uint32_t **buffer,size_t *capacity,s
     if(next-old>PW_WINDOW_EFFECTS_LIMIT-effects->bytes) {errno=ENOSPC;return -1;}
     uint32_t *grown=realloc(*buffer,next);
     if(!grown) {errno=ENOMEM;return -1;}
+    /* Fault the new pages now, while the frame is still being set up, so a later scan of this
+     * scratch does not enter the kernel for memory. */
+    memset((char *)grown+old,0,next-old);
     *buffer=grown;*capacity=pixels;effects->bytes+=next-old;
     return 0;
 }
@@ -76,6 +79,21 @@ static int reserve_blur(PwWindowEffects *effects,size_t pixels)
     size_t second=effects->blur_capacity;
     if(reserve(effects,&effects->blur[0],&effects->blur_capacity,pixels))return -1;
     return reserve(effects,&effects->blur[1],&second,pixels);
+}
+/* The scratch a 1920x1080 composition can ask for, touched once before the first frame that needs
+ * it. Later frames find the capacity already there and do not allocate. */
+static void prepare_workspace(PwWindowEffects *effects,uint32_t width,uint32_t height)
+{
+    size_t acrylic,mica;
+    if(!effects || effects->blur_capacity || !width || !height)return;
+    acrylic=(size_t)((width+PW_ACRYLIC_SCALE-1)/PW_ACRYLIC_SCALE)*((height+PW_ACRYLIC_SCALE-1)/PW_ACRYLIC_SCALE);
+    mica=(size_t)((width+PW_MICA_SCALE-1)/PW_MICA_SCALE)*((height+PW_MICA_SCALE-1)/PW_MICA_SCALE);
+    if(reserve_blur(effects,acrylic))return;
+    if(reserve(effects,&effects->mica,&effects->mica_capacity,mica))return;
+    if(reserve(effects,&effects->mica_alt,&effects->mica_alt_capacity,mica))return;
+    if(reserve(effects,&effects->mica_alt_scratch,&effects->mica_alt_scratch_capacity,
+               pw_window_mica_alt_scratch(width,height)))return;
+    (void)reserve(effects,&effects->source,&effects->source_capacity,(size_t)width*height);
 }
 static void tint_for(const PwWindowRow *row,Material *material)
 {
@@ -722,6 +740,7 @@ int pw_windows_compose_effects(uint32_t *output,uint32_t width,uint32_t height,
        snapshot->count>PW_WINDOW_LIMIT || snapshot->clip_count>PW_WINDOW_CLIP_LIMIT ||
        snapshot->thumbnail_count>PW_WINDOW_THUMBNAIL_LIMIT || count>PW_WINDOW_IMAGE_LIMIT || (count && !images)) {errno=EINVAL;return -1;}
     if(snapshot->overflow) {errno=EOVERFLOW;return -1;}
+    if(effects)prepare_workspace(effects,width,height);
     for(size_t i=0;i<count;++i) {
         const PwWindowImage *image=&images[i];
         uint64_t needed=(uint64_t)(image->height?image->height-1:0)*image->stride+(uint64_t)image->width*4;

@@ -69,6 +69,30 @@ int pw_session_memory_parse(const char *text, struct PwSessionMemory *out)
         } else if (key_is(row, "PROTON_SYSTEM_MEMORY_RAW", &value) && parse_mib(value, &mib)) {
             out->raw_set = 1;
             out->raw = mib != 0;
+        } else if (key_is(row, "PROTON_SYSTEM_POOL", &value) && parse_mib(value, &mib)) {
+            out->pool_set = 1;
+            out->pool_on = mib != 0;
+        } else if (key_is(row, "PROTON_SYSTEM_POOL_WARN", &value) && parse_mib(value, &mib)) {
+            out->pool_warn_set = 1;
+            out->pool_warn_mib = mib;
+        } else if (key_is(row, "PROTON_SYSTEM_POOL_KILL", &value) && parse_mib(value, &mib)) {
+            out->pool_kill_set = 1;
+            out->pool_kill_mib = mib;
+        } else if (key_is(row, "PROTON_SYSTEM_POOL_HOLD", &value) && parse_mib(value, &mib)) {
+            out->pool_hold_set = 1;
+            out->pool_hold_s = mib;
+        } else if (key_is(row, "PROTON_SYSTEM_POOL_RELEASE", &value) && parse_mib(value, &mib)) {
+            out->pool_release_set = 1;
+            out->pool_release_mib = mib;
+        } else if (key_is(row, "PROTON_SYSTEM_POOL_SPIKE", &value) && parse_mib(value, &mib)) {
+            out->pool_spike_set = 1;
+            out->pool_spike_mib = mib;
+        } else if (key_is(row, "PROTON_HANG_DISPLAY_MS", &value) && parse_mib(value, &mib)) {
+            out->hang_display_set = 1;
+            out->hang_display_ms = mib;
+        } else if (key_is(row, "PROTON_HANG_DISPLAY_WARN_MS", &value) && parse_mib(value, &mib)) {
+            out->hang_display_warn_set = 1;
+            out->hang_display_warn_ms = mib;
         } else {
             out->ignored++;
         }

@@ -63,6 +63,24 @@ typedef struct {
 /* EINVAL for a NULL argument. The same sample always gives the same verdict. */
 int pw_hang_breaker_decide(const PwHangSample *sample, PwHangVerdict *verdict);
 
+/* The flight recorder's stalled picture, separate from pw_hang_breaker_decide. STALLED only when
+ * the session has presented a frame, stall_ms is not 0, flat_ms (no new flip) is at least stall_ms,
+ * and either the title's last kern.proc wait is vmwait or pressure is set (the raw census is already
+ * at the firmware limit). An idle launcher that has never presented stays FINE. A long gap while the
+ * census is under that limit and the title is not in vmwait stays FINE. stall_ms 0 disables it. */
+typedef struct PwHangDisplay {
+    uint64_t flat_ms;
+    uint32_t stall_ms;
+    int presented;
+    int vmwait;
+    int pressure; /* the raw resident census is already at the firmware limit */
+} PwHangDisplay;
+
+int pw_hang_display_decide(const PwHangDisplay *sample, PwHangVerdict *verdict);
+/* 1 in *warning when the picture has been flat for warn_ms but not yet stall_ms, and either the title waits in
+ * vmwait or pressure is set. EINVAL for NULL. A stall is not also a warning. */
+int pw_hang_display_warn(const PwHangDisplay *sample, uint32_t warn_ms, int *warning);
+
 /* 1 when the broker's client lock was found held at this many samples in a row, PW_HANG_WEDGE_S or more, and the last
  * of them came span_ms after the first, PW_HANG_WEDGE_S - 1 s or more; else 0. */
 int pw_hang_breaker_wedged(unsigned samples, uint64_t span_ms);

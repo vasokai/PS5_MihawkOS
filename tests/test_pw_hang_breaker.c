@@ -73,6 +73,42 @@ int main(void)
     const PwHangSample sample = {0, 0, 1, 0};
     assert(pw_hang_breaker_decide(NULL, &verdict) == EINVAL && pw_hang_breaker_decide(&sample, NULL) == EINVAL);
 
+    /* The display watchdog: a presented picture, flat, and the title in vmwait. Neither an idle
+     * launcher nor a title that is still running is a hang, and a zero threshold disables it. */
+    {
+        PwHangDisplay display = {9999, 10000, 1, 1, 0};
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_FINE);
+        display.flat_ms = 10000;
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_STALLED);
+        display.presented = 0;
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_FINE);
+        display.presented = 1;
+        display.vmwait = 0;
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_FINE);
+        display.vmwait = 1;
+        display.stall_ms = 0;
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_FINE);
+        assert(pw_hang_display_decide(NULL, &verdict) == EINVAL && pw_hang_display_decide(&display, NULL) == EINVAL);
+        /* A picture already shown, flat, while the raw census is at the limit: warn at 2 s, recover at 5 s.
+         * The same gap under the limit, with the title not in vmwait, is not a hang. */
+        display = (PwHangDisplay){1999, 5000, 1, 0, 1};
+        int warning = 1;
+        assert(!pw_hang_display_warn(&display, 2000, &warning) && !warning);
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_FINE);
+        display.flat_ms = 2000;
+        assert(!pw_hang_display_warn(&display, 2000, &warning) && warning);
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_FINE);
+        display.flat_ms = 5000;
+        assert(!pw_hang_display_warn(&display, 2000, &warning) && !warning);
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_STALLED);
+        display.pressure = 0;
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_FINE);
+        display.vmwait = 1;
+        assert(!pw_hang_display_decide(&display, &verdict) && verdict == PW_HANG_STALLED);
+        assert(pw_hang_display_warn(NULL, 2000, &warning) == EINVAL);
+        assert(pw_hang_display_warn(&display, 2000, NULL) == EINVAL);
+    }
+
     /* The hangs, each read both ways: the latest onset the log allows must be ended by the time given, the earliest
      * must not be ended before the hang began. */
     /* A 2026-10-14 freeze (record removed from the tree; its title log, not in the tree): 187 frames between alive 150 and

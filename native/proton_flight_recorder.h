@@ -30,6 +30,11 @@ struct ProtonFlightSources {
     int (*foreground)();                                                  /* the server's foreground process, or null */
     int (*census)(struct pw_memory_census *);                             /* the memory helper's census, or null */
     bool (*end_helpers)(const char *why);   /* the title's SIGKILL ending (native/proton_wine.cpp), or null: report only */
+    unsigned display_stall_ms;              /* no new frame this long ends the session when the title is in vmwait or the raw census is at pressure_mib; 0 off */
+    unsigned display_warn_ms;               /* the same condition, a notice only, before the stall; 0 off */
+    unsigned pressure_mib;                  /* a raw resident census at or above this MiB counts as pressure; 0 never */
+    void (*notice)(const char *text);       /* on-screen notice when the session is ended, or null */
+    void (*warn_notice)(const char *text);  /* on-screen notice when the picture pauses, or null */
 };
 /* The hang breaker's last sample and verdict (src/pw_hang_breaker.h), from the title's loop. */
 void proton_flight_publish(uint64_t present_age_ms, uint64_t census_age_ms, bool census_known, bool stalled);

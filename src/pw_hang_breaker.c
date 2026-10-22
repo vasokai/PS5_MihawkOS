@@ -14,6 +14,27 @@ int pw_hang_breaker_decide(const PwHangSample *sample, PwHangVerdict *verdict)
     return 0;
 }
 
+static int display_hot(const PwHangDisplay *sample)
+{
+    return sample->presented && (sample->vmwait || sample->pressure);
+}
+
+int pw_hang_display_decide(const PwHangDisplay *sample, PwHangVerdict *verdict)
+{
+    if (!sample || !verdict) return EINVAL;
+    *verdict = display_hot(sample) && sample->stall_ms && sample->flat_ms >= sample->stall_ms
+        ? PW_HANG_STALLED : PW_HANG_FINE;
+    return 0;
+}
+
+int pw_hang_display_warn(const PwHangDisplay *sample, uint32_t warn_ms, int *warning)
+{
+    if (!sample || !warning) return EINVAL;
+    *warning = display_hot(sample) && warn_ms && sample->stall_ms && sample->flat_ms >= warn_ms &&
+               sample->flat_ms < sample->stall_ms;
+    return 0;
+}
+
 int pw_hang_breaker_wedged(unsigned samples, uint64_t span_ms)
 {
     return samples >= PW_HANG_WEDGE_S && span_ms >= (PW_HANG_WEDGE_S - 1) * 1000ull;

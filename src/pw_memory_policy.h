@@ -51,6 +51,23 @@ typedef struct PwSessionMemory {
     unsigned end_mib;
     int raw_set;
     int raw; /* 1: the guard is fed the raw census */
+    /* The raw-census governor and the display watchdog (src/pw_system_pool.h). */
+    int pool_set;
+    int pool_on; /* PROTON_SYSTEM_POOL: 0 off, nonzero on */
+    int pool_warn_set;
+    unsigned pool_warn_mib;
+    int pool_kill_set;
+    unsigned pool_kill_mib;
+    int pool_hold_set;
+    unsigned pool_hold_s; /* PROTON_SYSTEM_POOL_HOLD, seconds */
+    int pool_release_set;
+    unsigned pool_release_mib;
+    int pool_spike_set;
+    unsigned pool_spike_mib; /* PROTON_SYSTEM_POOL_SPIKE: a rise of this many MiB pauses a helper */
+    int hang_display_set;
+    unsigned hang_display_ms; /* PROTON_HANG_DISPLAY_MS; 0 disables the watchdog */
+    int hang_display_warn_set;
+    unsigned hang_display_warn_ms; /* PROTON_HANG_DISPLAY_WARN_MS */
     unsigned ignored; /* non-empty lines that were not a comment or a known key */
 } PwSessionMemory;
 

@@ -95,6 +95,7 @@ declare -A sources=(
     [test_pw_pipe_memory]="src/pw_pipe_memory.c"
     [test_pw_memory_guard]="src/pw_memory_guard.c"
     [test_pw_memory_policy]="src/pw_memory_policy.c"
+    [test_pw_system_pool]="src/pw_system_pool.c src/pw_memory_policy.c"
     [test_pw_hang_breaker]="src/pw_hang_breaker.c"
     [test_pw_log_sessions]="src/pw_log_sessions.c"
     [test_pw_detailed_logs]="src/pw_detailed_logs.c src/pw_log_sessions.c"

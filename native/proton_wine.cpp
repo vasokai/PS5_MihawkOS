@@ -28,6 +28,7 @@ extern "C" {
 #include "../src/pw_pad_script.h"
 #include "../src/pw_memory_guard.h"
 #include "../src/pw_memory_policy.h"
+#include "../src/pw_system_pool.h"
 #include "../src/pw_firmware.h"
 #include "../src/pw_hang_breaker.h"
 #include "../src/pw_log_sessions.h"
@@ -61,6 +62,7 @@ uint64_t sceKernelGetProcessTime(void);
 int scePthreadSetprio(pthread_t thread, int priority);
 int sceKernelGetCurrentCpu(void);
 int sceKernelSendNotificationRequest(int, void *, size_t, int);
+int sceKernelGetResidentFmemCount(int pid, uint64_t *resident, uint64_t *mapped);
 void catchReturnFromMain(int);
 }
 #include <pthread.h>
@@ -148,8 +150,9 @@ void (*owner_wait)() = nullptr;
 // the system shows over the title (the owner saw one, phase 0's probe 5), with no shell code. Each notice is also kept
 // for the launcher, which shows it after the session (PROTON_SESSION_NOTICES), in case it was missed. Each kind is said
 // once a session, from the title's loop or on the way back to the launcher; any other thread only fills its slot.
-enum NoticeKind { NOTICE_MEMORY_CLOSE, NOTICE_MEMORY_END, NOTICE_SPAWN, NOTICE_GPU, NOTICE_FOLDER,
-                  NOTICE_TEST, NOTICE_KINDS };
+enum NoticeKind { NOTICE_MEMORY_CLOSE, NOTICE_MEMORY_END, NOTICE_POOL_WARN, NOTICE_POOL_TRIM,
+                  NOTICE_POOL_KILL, NOTICE_POOL_SUSPEND, NOTICE_HANG, NOTICE_DISPLAY_WARN, NOTICE_SPAWN, NOTICE_GPU,
+                  NOTICE_FOLDER, NOTICE_TEST, NOTICE_KINDS };
 // 0 empty, 1 being written, 2 ready, 3 kept for the launcher and posted
 struct Notice { std::atomic<int> state{0}; char text[512]; };
 Notice notices[NOTICE_KINDS];
@@ -224,6 +227,19 @@ void notices_post()
         const int posted = sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
         say("notice: %s (posted %d)", notice.text, posted);
     }
+}
+
+// The flight recorder's thread: the picture stopped while this thread still runs.
+static void hang_notice(const char *text)
+{
+    notice_set(NOTICE_HANG, "%s", text ? text : "");
+    notices_post();
+}
+
+static void hang_warn_notice(const char *text)
+{
+    notice_set(NOTICE_DISPLAY_WARN, "%s", text ? text : "");
+    notices_post();
 }
 
 // 1 for a 32-bit image fixed at 0x400000 (src/pw_pe_arch.h), by its Windows path in the session's prefix: its helper
@@ -502,6 +518,45 @@ uint64_t monotonic_ms()
 
 int signal_process(int pid, int signal) { return kill(pid, signal) ? errno : 0; }
 
+// Resident flexible memory of each helper the title started. That is the figure the kernel bills to the system
+// pool; for a helper running Windows code it is mostly the executable copy that helper holds. The memory helper
+// is left out. A refused call leaves that helper out and is said once.
+void pool_charges(PwPoolCharge *rows, unsigned capacity, unsigned *count, int *newest, uint64_t *newest_bytes,
+                  int *memory_pid)
+{
+    static bool refused = false;
+    int pids[PW_HANG_MAX_HELPERS];
+    int memory = 0;
+    const unsigned listed = list_helpers ? list_helpers(pids, PW_HANG_MAX_HELPERS, &memory) : 0;
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    unsigned used = 0;
+    int new_pid = 0;
+    uint64_t new_bytes = 0;
+
+    if (memory_pid) *memory_pid = memory;
+    for (unsigned i = 0; i < listed && used < capacity; ++i) {
+        uint64_t pages = 0, mapped = 0;
+        if (pids[i] <= 1 || pids[i] == memory) continue;
+        if (sceKernelGetResidentFmemCount(pids[i], &pages, &mapped)) {
+            if (!refused) {
+                refused = true;
+                say("Wine: a helper's flexible charge was not read (errno %d); the pool governor uses the census", errno);
+            }
+            continue;
+        }
+        rows[used].pid = pids[i];
+        rows[used].bytes = pages * (page ? page : 16384);
+        if (pids[i] > new_pid) {
+            new_pid = pids[i];
+            new_bytes = rows[used].bytes;
+        }
+        ++used;
+    }
+    *count = used;
+    *newest = new_pid;
+    *newest_bytes = new_bytes;
+}
+
 // PROTON_STOP_TERMINATE=1: the server may end a game whose helpers the kernel would not let the title SIGKILL. Opt-in:
 // that ending preceded the console's power-offs (2026-10-03, and a 2026-10-14 run's stop; record removed from the tree).
 bool server_terminate_asked()
@@ -540,6 +595,46 @@ void wait_for_ended_helpers()
         read ? (long long)(monotonic_ms() - census.taken_ms) : -1ll, frames,
         (unsigned long long)(monotonic_ms() - ended.sent_ms));
     if (title_log_fd >= 0) fsync(title_log_fd);
+}
+
+// One prefix sync at a time. sync() walks every dirty page on /data; a download can make that seconds, so the
+// 30 s path runs it off this loop. A second request while one is in flight is skipped, not piled up.
+std::atomic<int> prefix_sync_running{0};
+
+// The wineserver fsyncs each hive before renaming it (patch 0886) and does not fsync the prefix directory, so a
+// power loss can still drop the rename. fsync of the directory publishes user.reg, system.reg and userdef.reg.
+// Credential Manager lives in user.reg. crypt32 is unpatched: its DPAPI master key is that hive and the files
+// under drive_c/users/Mihawk/AppData. /data is nullfs on bfs and is not mounted synchronous, so a hard reboot
+// drops pages the kernel has not written back. wait_files syncs them before LoadExec; otherwise a background sync does.
+void save_prefix(const char *why, bool wait_files)
+{
+    int registry = -1;
+    unsigned long long took_ms = 0;
+    if (flush_registry) {
+        const uint64_t start = sceKernelGetProcessTime();
+        registry = flush_registry(3000);
+        took_ms = (sceKernelGetProcessTime() - start) / 1000;
+    }
+    if (!session_prefix.empty()) {
+        const int fd = open(session_prefix.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            fsync(fd);
+            close(fd);
+        }
+    }
+    if (wait_files) {
+        sync();
+        say("Wine: prefix saved (%s): registry %s in %llu ms, files synced", why,
+            !flush_registry ? "not asked" : registry ? "NOT saved" : "saved", took_ms);
+        return;
+    }
+    if (flush_registry && (registry || took_ms >= 250))
+        say("Wine: registry %s in %llu ms (%s)", registry ? "NOT saved" : "saved", took_ms, why);
+    if (prefix_sync_running.exchange(1)) return;
+    std::thread([]() {
+        sync();
+        prefix_sync_running.store(0, std::memory_order_release);
+    }).detach();
 }
 
 // reason: why the session failed, shown by the launcher (ProtonLaunch::ended); null for an ordinary end.
@@ -590,14 +685,10 @@ void return_to_launcher(const char *reason)
             say("Wine: a grain still held the audio sink; the port goes with the process");
         }
     }
-    // The prefix's registry goes to disk before LoadExec replaces the process,
-    // whether the game ended or the title stops it (patch 0886).
-    if (flush_registry) {
-        const uint64_t start = sceKernelGetProcessTime();
-        const int status = flush_registry(3000);
-        say("Wine: registry %s in %llu ms", status ? "NOT saved" : "saved",
-            (unsigned long long)((sceKernelGetProcessTime() - start) / 1000));
-    }
+    // The prefix's registry, then its files, before LoadExec replaces the process.
+    // Credential Manager is user.reg. A program's settings and crypt32's DPAPI
+    // master key are ordinary files under drive_c; /data is not mounted synchronous.
+    save_prefix("session end", true);
     // Last, after every bounded step above: replacing the title while a program's threads still ran powered the
     // console off (2026-10-03), so a helper sent SIGKILL is waited for here, for as long as it takes. Claimed here if no
     // one has: a SIGKILL sent after this check would not be waited for.
@@ -637,7 +728,11 @@ __attribute__((format(printf, 1, 2))) void fail(const char *format, ...)
 // what it calls takes only child_lock (pw_ps5_end_spawns, pw_ps5_helpers), never held across a wait.
 bool end_helpers(const char *why)
 {
-    if (!list_helpers || ending.exchange(true)) return false;
+    if (!list_helpers) return false;
+    // SIGKILL of the helpers is what a full memory session freezes on. The registry has to be on disk first:
+    // return_to_launcher's save runs only after those helpers are gone, and a freeze never gets there.
+    save_prefix("before helpers are ended", false);
+    if (ending.exchange(true)) return false;
     if (end_spawns) end_spawns();
     int pids[PW_HANG_MAX_HELPERS];
     const unsigned count = list_helpers(pids, PW_HANG_MAX_HELPERS, nullptr);
@@ -1915,6 +2010,30 @@ void proton_run_wine()
                 PW_MEMORY_FLEXIBLE_RESERVE_MIB,
                 memory_limit > PW_MEMORY_CENSUS_BACKSTOP_MIB ? memory_limit : PW_MEMORY_CENSUS_BACKSTOP_MIB);
     }
+    PwSystemPoolConfig pool_config{};
+    pw_system_pool_choose(default_limit, memory_choice.off, session_memory_status ? nullptr : &session_memory,
+                          getenv("PROTON_SYSTEM_POOL"), getenv("PROTON_SYSTEM_POOL_WARN"),
+                          getenv("PROTON_SYSTEM_POOL_KILL"), getenv("PROTON_SYSTEM_POOL_HOLD"),
+                          getenv("PROTON_SYSTEM_POOL_RELEASE"), getenv("PROTON_HANG_DISPLAY_MS"),
+                          getenv("PROTON_SYSTEM_POOL_SPIKE"), getenv("PROTON_HANG_DISPLAY_WARN_MS"), &pool_config);
+    PwSystemPool pool_state{};
+    const char *pool_label = pool_config.off ? "off" : "fine";
+    // Helper charges last sample, and the live raw figure over the last half second, so a spike is
+    // visible inside 200 ms even when the memory helper's census is still the previous half second.
+    PwPoolCharge pool_seen[PW_HANG_MAX_HELPERS]{};
+    unsigned pool_seen_count = 0;
+    uint64_t pool_census_base = 0, pool_helper_base = 0;
+    uint32_t pool_census_seq = 0;
+    int pool_census_ready = 0;
+    struct { uint64_t ms, live; } pool_hist[4]{};
+    unsigned pool_hist_i = 0;
+    if (pool_config.off)
+        say("Wine: system pool governor off");
+    else
+        say("Wine: system pool governor warn %u MiB, kill %u MiB, spike %u MiB, pause %u ms, release %u MiB; "
+            "a rise pauses the helper that grew; display watchdog warn %u ms, act %u ms",
+            pool_config.warn_mib, pool_config.kill_mib, pool_config.spike_mib, pool_config.spike_hold_ms,
+            pool_config.release_mib, pool_config.display_warn_ms, pool_config.display_ms);
     pw_memory_guard memory_guard{};
     pw_memory_guard_init(&memory_guard, memory_limit, memory_end);
     PwMemoryPressure memory_pressure{};
@@ -1941,6 +2060,12 @@ void proton_run_wine()
             "census is as old%s%s", breaker_stall_ms && breaker_stall_ms < PW_HANG_STALL_MS ? breaker_stall_ms : PW_HANG_STALL_MS,
             !list_helpers ? "; this runtime lists no helpers, so it only reports" : breaker_acts ? "" :
             "; PROTON_HANG_BREAKER=0, so it only reports", breaker_freeze_ms ? "; test: the census is taken as frozen" : "");
+        if (pool_config.display_ms)
+            say("Wine: display watchdog armed: warn at %u ms, end the Windows session at %u ms with no new frame "
+                "while the title waits in vmwait or system memory is at the %u MiB limit",
+                pool_config.display_warn_ms, pool_config.display_ms, pool_config.kill_mib);
+        else
+            say("Wine: display watchdog off");
 #endif
     // The flight recorder (native/proton_flight_recorder.h), for every session of the owner layout.
     if (owner_bootstrap) {
@@ -1949,7 +2074,13 @@ void proton_run_wine()
         flight.memory_lock_busy = symbol<int (*)()>("pw_ps5_memory_lock_busy");
         flight.foreground = server_foreground;
         flight.census = memory_census;
-        // A wedged broker ends the game from the recorder's thread, which kept running when this loop did not.
+        // A wedged broker, or a picture that has stopped while the title waits, ends the game from the recorder's
+        // thread, which kept running when this loop did not.
+        flight.display_stall_ms = pool_config.display_ms;
+        flight.display_warn_ms = pool_config.display_warn_ms;
+        flight.pressure_mib = pool_config.kill_mib;
+        flight.notice = hang_notice;
+        flight.warn_notice = hang_warn_notice;
         if (programs_in_helpers && breaker_acts) flight.end_helpers = end_helpers;
         proton_flight_recorder_start(flight);
     }
@@ -2199,20 +2330,12 @@ void proton_run_wine()
             }
         }
 #endif
-        // The registry goes to disk every 30 s, as it would on Windows, where a program's setup is kept even when the
-        // session is cut short. The wineserver saves only when its last process ends (patch 0886 adds the title's
-        // request), so a session that was ended from outside (the memory guard, the PS button, a crash) lost
-        // everything it wrote: a launcher ran its DirectX and Visual C++ install scripts again in the next session
-        // because their markers had never reached the disk (runprocess_log.txt: two full runs, 2026-10-10 21:00 and
-        // 21:22). A clean registry is skipped by the server, so the request costs nothing when nothing changed.
-        if (tick && tick % 3750 == 0 && flush_registry) {
-            const uint64_t begin = sceKernelGetProcessTime();
-            const int status = flush_registry(3000);
-            const uint64_t took_ms = (sceKernelGetProcessTime() - begin) / 1000;
-            if (status || took_ms >= 250)
-                say("Wine: registry %s in %llu ms (every 30 s)", status ? "NOT saved" : "saved",
-                    (unsigned long long)took_ms);
-        }
+        // The registry goes to disk every 30 s, and a background sync pushes the prefix's files with it. The
+        // wineserver saves only when its last process ends (patch 0886 adds the title's request) and the in-process
+        // server never exits, so a session cut short from outside used to lose everything since the previous save.
+        // A clean registry is skipped by the server. The file sync does not run on this loop: /data writeback of a
+        // download can take seconds.
+        if (tick && tick % 3750 == 0) save_prefix("every 30 s", false);
         // The census is read every half second, guard or not: the hang breaker goes by its age. A read that fails (the
         // helper was writing it) keeps the last whole one; the copy it was given may be torn (src/pw_memory_helper.c).
         bool census_read = false;
@@ -2346,6 +2469,85 @@ void proton_run_wine()
                 }
             }
         }
+        // The raw resident figure, every 200 ms (24 ticks of this 8333 us loop). The memory helper publishes
+        // its census every half second; helper growth since that census is added here, so a renderer that has
+        // just started is visible before the next census. A steady level under the firmware limit is left
+        // alone. A rise pauses the helper that grew. The title is never signalled.
+        if (tick % 24 == 0 && !pool_config.off) {
+            pw_memory_census live_census = census;
+            if (memory_census && !memory_census(&live_census)) census = live_census;
+            PwPoolCharge charges[PW_HANG_MAX_HELPERS];
+            unsigned charge_count = 0;
+            int newest = 0, memory_pid = 0, target = 0, grower = 0;
+            uint64_t newest_bytes = 0, helper_sum = 0, grew = 0;
+            pool_charges(charges, PW_HANG_MAX_HELPERS, &charge_count, &newest, &newest_bytes, &memory_pid);
+            for (unsigned i = 0; i < charge_count; ++i) {
+                uint64_t previous = 0;
+                int known = 0;
+                helper_sum += charges[i].bytes;
+                for (unsigned s = 0; s < pool_seen_count; ++s)
+                    if (pool_seen[s].pid == charges[i].pid) { previous = pool_seen[s].bytes; known = 1; break; }
+                const uint64_t delta = !known ? charges[i].bytes : charges[i].bytes > previous ? charges[i].bytes - previous : 0;
+                if (delta > grew && charges[i].pid > 1 && charges[i].pid != getpid() && charges[i].pid != memory_pid) {
+                    grew = delta;
+                    grower = charges[i].pid;
+                }
+            }
+            pool_seen_count = charge_count < PW_HANG_MAX_HELPERS ? charge_count : PW_HANG_MAX_HELPERS;
+            for (unsigned i = 0; i < pool_seen_count; ++i) pool_seen[i] = charges[i];
+            if (!pool_census_ready || census.sequence != pool_census_seq) {
+                pool_census_seq = census.sequence;
+                pool_census_base = census.system;
+                pool_helper_base = helper_sum;
+                pool_census_ready = 1;
+            }
+            uint64_t live = pool_census_base;
+            if (helper_sum > pool_helper_base) live += helper_sum - pool_helper_base;
+            const uint64_t now = monotonic_ms();
+            uint64_t rise = 0, oldest_ms = now, oldest_live = live;
+            int window = 0;
+            for (const auto &sample : pool_hist) {
+                if (!sample.ms || now < sample.ms || now - sample.ms > 500) continue;
+                if (!window || sample.ms < oldest_ms) { oldest_ms = sample.ms; oldest_live = sample.live; window = 1; }
+            }
+            if (window && live > oldest_live) rise = live - oldest_live;
+            pool_hist[pool_hist_i++ % 4] = {now, live};
+            if (!grower)
+                grower = pw_system_pool_victim(charges, charge_count, census.largest_pid, census.largest,
+                                               newest, newest_bytes, getpid(), memory_pid);
+            const int action = pw_system_pool_sample(&pool_state, &pool_config, live, rise, now, grower, getpid(), &target);
+            const unsigned long long live_mib = live >> 20;
+            const unsigned long long rise_mib = rise >> 20;
+            if (action == PW_POOL_WARN) {
+                pool_label = "warn";
+                notice_set(NOTICE_POOL_WARN, "The PS5's system memory is nearly full.");
+                say("Wine: system pool warn: live %llu MiB, warn %u MiB, no helper can be paused",
+                    live_mib, pool_config.warn_mib);
+            } else if (action == PW_POOL_SUSPEND) {
+                pool_label = "pause";
+                const int status = signal_process(target, SIGSTOP);
+                notice_set(NOTICE_POOL_SUSPEND, "The PS5's system memory spiked: one Windows program was paused "
+                           "so the console would keep drawing.");
+                say("Wine: system pool suspend: live %llu MiB, rose %llu MiB in the last half second, "
+                    "pausing process %d (errno %d)", live_mib, rise_mib, target, status);
+            } else if (action == PW_POOL_KILL) {
+                pool_label = "kill";
+                const int status = signal_process(target, SIGKILL);
+                notice_set(NOTICE_POOL_KILL, "The PS5's system memory stayed full: one Windows program was ended.");
+                say("Wine: system pool kill: live %llu MiB, kill %u MiB, SIGKILL %d (errno %d)",
+                    live_mib, pool_config.kill_mib, target, status);
+            } else if (action == PW_POOL_RESUME) {
+                pool_label = "fine";
+                const int status = signal_process(target, SIGCONT);
+                say("Wine: system pool resume: live %llu MiB, continuing process %d (errno %d)",
+                    live_mib, target, status);
+            } else if (action == PW_POOL_CLEAR) {
+                pool_label = "fine";
+                const unsigned under = pool_config.release_mib >= pool_config.warn_mib ? 0
+                    : pool_config.warn_mib - pool_config.release_mib;
+                say("Wine: system pool clear: live %llu MiB, under %u MiB", live_mib, under);
+            }
+        }
 #ifdef PS5_GPU_BROKER
         // The hang breaker (src/pw_hang_breaker.h), once a second; the flight recorder prints what it saw.
         if (breaker_armed && tick % 120 == 60) {
@@ -2413,7 +2615,8 @@ void proton_run_wine()
                     snprintf(flexible_text, sizeof(flexible_text), "%llu MiB",
                              (unsigned long long)(memory_pressure_now.flexible_free >> 20));
                 say("Wine: system memory %llu MiB (helpers %llu MiB in %u, the largest %llu MiB in process %d), peak %llu MiB; "
-                    "%llu s of the last %u at the %u MiB limit; guarded %llu MiB, direct used %llu MiB, flexible free %s",
+                    "%llu s of the last %u at the %u MiB limit; guarded %llu MiB, direct used %llu MiB, flexible free %s; "
+                    "system pool %s",
                     (unsigned long long)(census.system >> 20),
                     (unsigned long long)(census.helpers >> 20), census.helper_count,
                     (unsigned long long)(census.largest >> 20), census.largest_pid,
@@ -2421,7 +2624,7 @@ void proton_run_wine()
                     (unsigned long long)(pw_memory_guard_pressure_ms(&memory_guard) / 1000),
                     PW_MEMORY_GUARD_WINDOW_MS / 1000, memory_limit,
                     (unsigned long long)(memory_pressure_now.guarded >> 20),
-                    (unsigned long long)(memory_pressure_now.direct_used >> 20), flexible_text);
+                    (unsigned long long)(memory_pressure_now.direct_used >> 20), flexible_text, pool_label);
             }
 #ifdef PS5_GPU_BROKER
             if (shown_last_ms)
