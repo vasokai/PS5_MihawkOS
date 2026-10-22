@@ -1,5 +1,11 @@
 # Plan
 
+## JIT objects are not charged once (2026-10-22, no console run)
+
+K14 and K18 already measured this. One shared JIT object is resident flexible memory in every process that maps it, in full: a 16 MiB object added 16 MiB to the taker and left the maker at 16 MiB (K14), and 28,054 shared clusters (448,864 KiB of mappings) moved the helper census from 1532 to 1568 MiB and SceShellCore RSS from 1524 to 1560, with kernel memory 431 to 464 MiB and 4 guard ends against 0 (K18, 2026-10-21). `wine/ps5/pw_wine_jit_share.h` keeps one fd per identical run of bytes and can map that object instead of creating another. It stays off. Enabling it does not lower the figure vmwait follows.
+
+The process itself is already on the application pool. A payload is budget 0, so main direct memory would be the system partition; `proton_payload_child.c` adopts `sceKernelAllocateDirectMemoryForApp` before ntdll starts (unless `WINE_PS5_PAYLOAD_DMEM=0`). Execute is dropped on that memory, so the JIT object cannot follow the process onto the pool. Heap, VirtualAlloc, file views and thread stacks are a separate change and are not edited here. Host tests `pw_wine_jit_share` and the shared-code case of `pw_wine_dmem_ps5`. No production build. No console run.
+
 ## Flexible pressure and anonymous direct memory (2026-10-22, no console run)
 
 A firmware 12.20 title log showed the resident census (the guard's old input) climb from 944 MiB to 1601 MiB in about
