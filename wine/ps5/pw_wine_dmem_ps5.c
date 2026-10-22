@@ -18,6 +18,7 @@
 #include "pw_wine_alias.h"
 #include "pw_wine_dmem.h"
 #include "pw_wine_heap.h"
+#include "pw_wine_jit_share.h"
 #include "pw_wine_pages.h"
 #include "pw_wine_perf.h"
 #include "pw_wine_vm.h"
@@ -776,6 +777,18 @@ static int jit_over(uintptr_t at, size_t bytes, const char **step)
 
     *step = "read-only";
     if ((rc = sceKernelMprotect((void *)at, bytes, PROT_READ))) goto refused;
+    /* Identical code can map the first helper's JIT object (pw_wine_jit_share.h). Off unless a caller enables it:
+     * K14 and K18 measured each mapping charged in full, so this does not lower the system pool. A miss, or a shared
+     * object that will not map at this size (K4), still creates a private object. Data mappings are not touched. */
+    {
+        int shared = -1;
+        if (pw_wine_jit_share_lookup((const void *)at, bytes, &shared) == 1 && shared >= 0) {
+            *step = "share-map";
+            rc = sceKernelMmap((void *)at, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, shared, 0, &over);
+            if (!rc && over == (void *)at) return 0;
+            if (!rc) (void)sceKernelMunmap(over, bytes);
+        }
+    }
     *step = "create";
     if ((rc = sceKernelJitCreateSharedMemory("pw-jit", bytes, PROT_READ | PROT_WRITE | PROT_EXEC, &fd))) goto refused;
     /* pwrite on a JIT object fails (ESPIPE, K5): the copy goes through a temporary mapping in the helper's shared-page
@@ -791,7 +804,8 @@ static int jit_over(uintptr_t at, size_t bytes, const char **step)
     *step = "map";
     if ((rc = sceKernelMmap((void *)at, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0, &over)))
         goto refused;
-    close(fd);   /* the mapping keeps the object (K6) */
+    pw_wine_jit_share_published((const void *)at, bytes, fd);
+    close(fd);   /* the mapping keeps the object (K6); a publisher dups fd first when sharing is on */
     return 0;
 refused:
     errno = (int)((unsigned)rc & 0xffff);

@@ -10,6 +10,7 @@
  *   cc -std=gnu11 -Itests/include tests/test_pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem.c \
  *      wine/ps5/pw_wine_heap.c wine/ps5/pw_wine_pages.c wine/ps5/pw_wine_vm.c -lpthread */
 #define _GNU_SOURCE
+#include "../wine/ps5/pw_wine_jit_share.h"
 #include "../wine/ps5/pw_wine_pages.h"
 #include <assert.h>
 #include <errno.h>
@@ -121,6 +122,7 @@ static unsigned call_count, releases;
 static size_t released_bytes;
 static uintptr_t refuse_low, refuse_high;
 static int refuse_jit, refuse_scratch, wait_for_writer;
+static unsigned jit_creates;
 static volatile int writer_faulted;
 
 int sceKernelMprotect(const void *address, size_t bytes, int protection)
@@ -154,6 +156,7 @@ int sceKernelJitCreateSharedMemory(const char *name, size_t bytes, int max_prote
     const time_t give_up = time(NULL) + 5;
     (void)max_protection;
     if (refuse_jit) return (int)0x8002000c;
+    jit_creates++;
     /* The writer of the lost-writes case faults on the read-only range before anything is copied. */
     while (wait_for_writer && !writer_faulted && time(NULL) < give_up) sched_yield();
     *fd = memfd_create(name, 0);
@@ -894,6 +897,48 @@ static void lay_measured(void)
     assert(__wine_ps5_lay(page, PAGE) == -1);
 }
 
+/* Sharing on: the second page of the same bytes maps the first page's object. Off is every other case. */
+static int shared_fd = -1;
+static int share_ask(const void *bytes, size_t size, int *fd)
+{
+    (void)bytes;
+    (void)size;
+    if (shared_fd < 0) return 0;
+    *fd = shared_fd;
+    return 1;
+}
+static void share_publish(const void *bytes, size_t size, int fd)
+{
+    (void)bytes;
+    (void)size;
+    if (shared_fd < 0) shared_fd = dup(fd);
+}
+static void shared_code(void)
+{
+    const uintptr_t base = region(64 << 20);
+    unsigned char *first = (unsigned char *)base + PAGE, *second = first + PAGE;
+    Entry a, b;
+    unsigned created;
+
+    payload(1, 1);
+    assert(!__wine_ps5_dmem_region((void *)base, 64 << 20));
+    created = jit_creates;
+    pw_wine_jit_share_enable(1);
+    pw_wine_jit_share_set_ask(share_ask);
+    pw_wine_jit_share_set_publish(share_publish);
+    assert(__wine_ps5_mmap(first, 2 * PAGE, RW, FIXED_ANON, -1, 0) == first);
+    memcpy(first, code, sizeof(code));
+    memcpy(second, code, sizeof(code));
+    assert(!__wine_ps5_mprotect(first, 2 * PAGE, RX));
+    assert(!__wine_ps5_exec_convert(first, PAGE, RX) && run(first) == 42);
+    assert(jit_creates == created + 1 && shared_fd >= 0);
+    assert(!__wine_ps5_exec_convert(second, PAGE, RX) && run(second) == 42);
+    assert(jit_creates == created + 1);
+    assert(entry_at((uintptr_t)first, &a) && entry_at((uintptr_t)second, &b));
+    assert(a.jit && b.jit && a.inode && a.inode == b.inode);
+    assert(!sdk_exec);
+}
+
 static void in_child(void (*test)(void), const char *name)
 {
     int status = 0;
@@ -928,6 +973,7 @@ int main(void)
     in_child(foreign_inside_reservation, "foreign inside a reservation");
     in_child(guard_exports, "guard exports");
     in_child(lay_measured, "lay measured");
+    in_child(shared_code, "shared code");
     puts("payload executable memory: direct and flexible memory never asked for execute, converted to JIT memory of "
          "exactly the range at the first execute through a temporary mapping in the helper's own range, contents "
          "and neighbours kept, direct memory released, then one kernel call per change; failures restored and "

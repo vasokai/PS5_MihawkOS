@@ -513,7 +513,7 @@ done
 # ntdll's anonymous memory comes from direct memory (patch 0600); every release of it forgets its aliases first
 # (pw_wine_alias, docs/MMU4K.md).
 dmem=""
-for unit in pw_wine_dmem pw_wine_dmem_ps5 pw_wine_section pw_wine_section_ps5 pw_wine_alias; do
+for unit in pw_wine_dmem pw_wine_dmem_ps5 pw_wine_jit_share pw_wine_section pw_wine_section_ps5 pw_wine_alias; do
     "$sdk/bin/prospero-clang" -std=c11 -O2 -Wall -Wextra -Werror -fPIC \
         -c "$root/wine/ps5/$unit.c" -o "$work/heap/$unit.o" || fail "cannot compile $unit.c"
     dmem="$dmem $work/heap/$unit.o"
