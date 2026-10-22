@@ -1,5 +1,22 @@
 # Plan
 
+## Flexible pressure and anonymous direct memory (2026-10-22, no console run)
+
+A firmware 12.20 title log showed the resident census (the guard's old input) climb from 944 MiB to 1601 MiB in about
+a minute while flexible memory stayed at 946–948 MiB free and the application pool still had about 10.5 GiB of 11.7 GiB
+free. The census rise (657 MiB) matched the direct-memory the session committed (653 MiB). The guard, whose firmware
+12 default is 1600/1670 MiB, ended the largest helper. `PROTON_SYSTEM_MEMORY_LIMIT=0` in a program's environment did
+not reach the title: the guard reads the title's environment and `/data/ps5proton/memory.conf`, and an explicit value
+used to be held down to the firmware default.
+
+`src/pw_memory_policy.h` feeds the guard the census minus direct-memory growth since the start, keeps a 96 MiB
+flexible-free floor and a 6144 MiB raw-census backstop, and lets a session raise or disable the limit. Helpers with
+the application allocator give a private anonymous mapping that has no address its own direct-memory region
+(`pw_wine_anon_fresh_direct`); executable mappings stay on flexible memory and become JIT at the first execute.
+Host test `pw_memory_policy`. Not run on a console. An earlier attempt to count one shared object once was reverted
+because the kernel's RSS followed the raw census (below, 2026-10-20): if swap-out climbs while flexible free stays
+high, this subtraction is wrong, and `PROTON_SYSTEM_MEMORY_RAW=1` restores the old input.
+
 ## A launcher to its sign-in window on the standard PS5 (2026-10-20, console; the Pro not yet)
 
 The goal (the owner, 2026-10-20): a launcher end to end, installer, start from the installer, the launcher itself, its

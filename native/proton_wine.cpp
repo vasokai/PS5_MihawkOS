@@ -27,6 +27,7 @@ extern "C" {
 #include "../src/pw_pipe_memory.h"
 #include "../src/pw_pad_script.h"
 #include "../src/pw_memory_guard.h"
+#include "../src/pw_memory_policy.h"
 #include "../src/pw_firmware.h"
 #include "../src/pw_hang_breaker.h"
 #include "../src/pw_log_sessions.h"
@@ -1869,42 +1870,55 @@ void proton_run_wine()
     unsigned shown_gaps_100 = 0;
 #endif
     const unsigned xi_buttons[] = {1,2,4,8,16,64,128,256,512,4096,8192,16384,32768};
-    // The console's system memory, which helpers draw on and the title does not (src/pw_memory_guard.h).
-    // PROTON_SYSTEM_MEMORY_LIMIT, in MiB, lowers the limit (0 turns the guard off), and PROTON_SYSTEM_MEMORY_END the
-    // mark past which a game is ended at once.
-    // The defaults are the Pro's (firmware 10.01); 12.00 and later has its own (src/pw_memory_guard.h), and a limit the run
-    // sets itself is held to that firmware's, as the Pro's was. The INSTALLED firmware decides, not the word an enabler
-    // reports: the Pro reported 12.09 and ran with the 12.00-and-later limit through alpha-2 (src/pw_firmware.h).
+    // The console's flexible memory, which still swaps a title that exhausts it (src/pw_memory_guard.h). The guard is
+    // fed the resident census minus direct-memory growth since the start (src/pw_memory_policy.h): direct memory is
+    // the 11 GiB application pool, and a session whose helpers committed it saw the raw census rise with that pool
+    // while flexible memory stayed free. PROTON_SYSTEM_MEMORY_LIMIT, in MiB, sets the mark (0 turns the guard off,
+    // including the flexible-pool floor and the raw-census backstop) and may be higher than the firmware default.
+    // PROTON_SYSTEM_MEMORY_END is the mark past which a program is ended at once. PROTON_SYSTEM_MEMORY_RAW=1 feeds
+    // the raw census, as before. The same three keys in /data/ps5proton/memory.conf apply to the whole session; the
+    // environment wins. A program's game.json does not reach this process when the desktop launched it.
+    // The defaults are the Pro's (firmware 10.01); 12.00 and later has its own (src/pw_memory_guard.h). The INSTALLED
+    // firmware decides, not the word an enabler reports (src/pw_firmware.h).
     unsigned firmware_reported = 0;
     const unsigned firmware_installed = pw_firmware_installed(&firmware_reported);
     const unsigned default_limit = pw_memory_guard_default_limit_mib(firmware_installed);
+    PwSessionMemory session_memory{};
+    const int session_memory_status = pw_session_memory_load(&session_memory, PW_SESSION_MEMORY_PATH);
+    PwMemoryLimitChoice memory_choice{};
+    pw_memory_limit_choose(default_limit, session_memory_status ? nullptr : &session_memory,
+                           getenv("PROTON_SYSTEM_MEMORY_LIMIT"), getenv("PROTON_SYSTEM_MEMORY_END"),
+                           getenv("PROTON_SYSTEM_MEMORY_RAW"), &memory_choice);
+    const unsigned memory_limit = memory_choice.limit_mib;
+    const unsigned memory_end = memory_choice.end_mib;
     {
         char installed_text[8] = "?", reported_text[8] = "?";
         pw_firmware_text(firmware_installed, installed_text, sizeof(installed_text));
         pw_firmware_text(firmware_reported, reported_text, sizeof(reported_text));
-        say("Wine: firmware %s installed (the system reports %s); the memory guard's limit is %u MiB", installed_text,
-            reported_text, default_limit);
+        say("Wine: firmware %s installed (the system reports %s); the memory guard's firmware default is %u MiB",
+            installed_text, reported_text, default_limit);
+        if (session_memory_status && session_memory_status != ENOENT)
+            say("Wine: %s was not read (errno %d)", PW_SESSION_MEMORY_PATH, session_memory_status);
+        else if (!session_memory_status && session_memory.ignored)
+            say("Wine: %s: %u line(s) ignored", PW_SESSION_MEMORY_PATH, session_memory.ignored);
+        if (memory_choice.off)
+            say("Wine: memory guard off (%s)", pw_memory_limit_source_name(memory_choice.source));
+        else
+            say("Wine: memory guard limit %u MiB, end %u MiB (%s%s%s)", memory_limit, memory_end,
+                pw_memory_limit_source_name(memory_choice.source),
+                memory_choice.above_default ? "; above the firmware default" : "",
+                memory_choice.raw ? "; counting the raw resident census" : "");
+        if (!memory_choice.off && !memory_choice.raw)
+            say("Wine: memory guard watches flexible pressure: the resident census minus direct-memory growth since "
+                "the start; flexible free at or below %u MiB, or a resident census at or above %u MiB, ends a program",
+                PW_MEMORY_FLEXIBLE_RESERVE_MIB,
+                memory_limit > PW_MEMORY_CENSUS_BACKSTOP_MIB ? memory_limit : PW_MEMORY_CENSUS_BACKSTOP_MIB);
     }
-    const char *memory_limit_setting = getenv("PROTON_SYSTEM_MEMORY_LIMIT");
-    const char *memory_end_setting = getenv("PROTON_SYSTEM_MEMORY_END");
-    const unsigned memory_limit_asked = memory_limit_setting ? (unsigned)strtoul(memory_limit_setting, nullptr, 10)
-                                                             : default_limit;
-    // Helpers' code is JIT memory, charged to their resident flexible memory with no cap but this guard, and a limit
-    // past the console's ~989 MiB (the earlier emulator experiment's runs asked 1250) is never reached before it swaps: a guard that never acts.
-    unsigned memory_limit = std::min(memory_limit_asked, default_limit);
-    if (memory_limit != memory_limit_asked)
-        say("Wine: PROTON_SYSTEM_MEMORY_LIMIT=%u MiB is past the guard's %u MiB; using %u MiB", memory_limit_asked,
-            default_limit, memory_limit);
-    const unsigned memory_end_asked = memory_end_setting ? (unsigned)strtoul(memory_end_setting, nullptr, 10)
-                                                         : memory_limit + PW_MEMORY_GUARD_END_MARGIN_MIB;
-    // An end mark past the guard's own is past the console's ~989 MiB before it is reached, and turns the steep-climb
-    // rule off. Not the lowered limit plus the margin: the gate's memory-guard case keeps its end out of reach.
-    unsigned memory_end = std::min(memory_end_asked, default_limit + PW_MEMORY_GUARD_END_MARGIN_MIB);
-    if (memory_end != memory_end_asked)
-        say("Wine: PROTON_SYSTEM_MEMORY_END=%u MiB is past the guard's %u MiB; using %u MiB", memory_end_asked,
-            default_limit + PW_MEMORY_GUARD_END_MARGIN_MIB, memory_end);
     pw_memory_guard memory_guard{};
     pw_memory_guard_init(&memory_guard, memory_limit, memory_end);
+    PwMemoryPressure memory_pressure{};
+    PwMemoryPressureOut memory_pressure_now{};
+    bool memory_direct_missing_said = false;
     pw_memory_census census{}, census_peak{};
     bool census_seen = false, census_missing_said = false, census_stale_said = false;
     // The hang breaker (src/pw_hang_breaker.h): once a second while the GPU broker shows a game whose processes are all
@@ -2221,8 +2235,8 @@ void proton_run_wine()
             } else {
                 const uint64_t age = monotonic_ms() - census.taken_ms;
                 if (!census_seen) {
-                    say("Wine: system memory %llu MiB in %u processes at the start; a game is asked to close when its "
-                        "helpers hold it at %u MiB for %u of %u s, and ended when they hold it past %u MiB for %u s",
+                    say("Wine: system memory %llu MiB in %u processes at the start; a game is asked to close when the "
+                        "guarded figure stays at %u MiB for %u of %u s, and ended when it stays past %u MiB for %u s",
                         (unsigned long long)(census.system >> 20), census.processes, memory_limit,
                         PW_MEMORY_GUARD_CLOSE_MS / 1000, PW_MEMORY_GUARD_WINDOW_MS / 1000, memory_end,
                         PW_MEMORY_GUARD_END_MS / 1000);
@@ -2233,7 +2247,40 @@ void proton_run_wine()
                     say("Wine: the system memory census is %llu ms old (status %d)", (unsigned long long)age,
                         census.status);
                 census_stale_said = age > 5000;
-                const pw_memory_verdict verdict = pw_memory_guard_sample(&memory_guard, census.system, census.taken_ms);
+                PwMemoryPressureIn pressure_in{};
+                struct ps5_memory_stats pools{};
+                pressure_in.census = census.system;
+                pressure_in.flexible_free = UINT64_MAX;
+                if (ps5_memory_query(&pools)) {
+                    pressure_in.direct_total = pools.total_bytes;
+                    pressure_in.direct_free = pools.free_bytes;
+                    pressure_in.flexible_free = pools.flexible_bytes;
+                } else if (!memory_direct_missing_said) {
+                    memory_direct_missing_said = true;
+                    say("Wine: direct memory was not read; until a reading arrives the guard counts the raw resident census");
+                }
+                pressure_in.backstop = (uint64_t)(memory_limit > PW_MEMORY_CENSUS_BACKSTOP_MIB ? memory_limit
+                                                                                              : PW_MEMORY_CENSUS_BACKSTOP_MIB) << 20;
+                pressure_in.flexible_reserve = (uint64_t)PW_MEMORY_FLEXIBLE_RESERVE_MIB << 20;
+                pressure_in.attribute_direct = !memory_choice.raw;
+                pw_memory_pressure_sample(&memory_pressure, &pressure_in, &memory_pressure_now);
+                uint64_t watched = memory_pressure_now.guarded;
+                if (memory_pressure_now.flexible_low || memory_pressure_now.census_backstop)
+                    watched = std::max(watched, memory_guard.end);
+                const pw_memory_verdict verdict = pw_memory_guard_sample(&memory_guard, watched, census.taken_ms);
+                char flexible_text[32] = "unknown";
+                if (memory_pressure_now.flexible_known)
+                    snprintf(flexible_text, sizeof(flexible_text), "%llu MiB",
+                             (unsigned long long)(memory_pressure_now.flexible_free >> 20));
+                char pressure_note[192];
+                snprintf(pressure_note, sizeof(pressure_note),
+                         "census %llu MiB, guarded %llu MiB, direct used %llu MiB (growth %llu), flexible free %s%s%s",
+                         (unsigned long long)(census.system >> 20),
+                         (unsigned long long)(memory_pressure_now.guarded >> 20),
+                         (unsigned long long)(memory_pressure_now.direct_used >> 20),
+                         (unsigned long long)(memory_pressure_now.direct_growth >> 20), flexible_text,
+                         memory_pressure_now.flexible_low ? "; flexible pool low" : "",
+                         memory_pressure_now.census_backstop ? "; resident census backstop" : "");
                 if (verdict != PW_MEMORY_FINE && desktop_session && census.largest_pid > 0) {
                     // The desktop session is the user's whole Windows: the guard acts on the process that holds the
                     // memory, not the session (user-desktop-2026-10-10-01: a launcher's GPU process reached 462 MiB and
@@ -2257,10 +2304,10 @@ void proton_run_wine()
                                  PW_MEMORY_GUARD_STEEP_NEAR_MIB, memory_limit);
                     else snprintf(why, sizeof(why), "stood past %u MiB for %u s", memory_end, PW_MEMORY_GUARD_END_MS / 1000);
                     say("Wine: the console's system memory %s (now %llu MiB; helpers %llu MiB in %u, "
-                        "the largest %llu MiB in process %d): %s that process, not the desktop session (%d)",
+                        "the largest %llu MiB in process %d; %s): %s that process, not the desktop session (%d)",
                         why, (unsigned long long)(census.system >> 20),
                         (unsigned long long)(census.helpers >> 20), census.helper_count,
-                        (unsigned long long)(census.largest >> 20), census.largest_pid,
+                        (unsigned long long)(census.largest >> 20), census.largest_pid, pressure_note,
                         verdict == PW_MEMORY_CLOSE ? "closing" : "ending", delivered);
                     pw_memory_guard_rearm(&memory_guard);
                 } else if (verdict == PW_MEMORY_CLOSE) {
@@ -2269,11 +2316,11 @@ void proton_run_wine()
                     const int delivered = stop_tick ? 0 : deliver(&close);
                     notice_set(NOTICE_MEMORY_CLOSE, "The PS5's memory is nearly full: the game was asked to close.");
                     say("Wine: the console's system memory stood at %u MiB or more for %llu of the last %u s (now %llu MiB; "
-                        "helpers %llu MiB in %u, the largest %llu MiB in process %d): %s (%d)", memory_limit,
+                        "helpers %llu MiB in %u, the largest %llu MiB in process %d; %s): %s (%d)", memory_limit,
                         (unsigned long long)(pw_memory_guard_pressure_ms(&memory_guard) / 1000),
                         PW_MEMORY_GUARD_WINDOW_MS / 1000, (unsigned long long)(census.system >> 20),
                         (unsigned long long)(census.helpers >> 20), census.helper_count,
-                        (unsigned long long)(census.largest >> 20), census.largest_pid,
+                        (unsigned long long)(census.largest >> 20), census.largest_pid, pressure_note,
                         stop_tick ? "the game is already closing" : "asking the game to close before the console swaps",
                         delivered);
                     if (!stop_tick) stop_tick = tick;
@@ -2288,9 +2335,9 @@ void proton_run_wine()
                                  PW_MEMORY_GUARD_STEEP_NEAR_MIB, memory_limit);
                     else snprintf(why, sizeof(why), "stood past %u MiB for %u s", memory_end, PW_MEMORY_GUARD_END_MS / 1000);
                     say("Wine: the console's system memory %s (now %llu MiB; helpers %llu MiB in %u, "
-                        "the largest %llu MiB in process %d): %s", why, (unsigned long long)(census.system >> 20),
+                        "the largest %llu MiB in process %d; %s): %s", why, (unsigned long long)(census.system >> 20),
                         (unsigned long long)(census.helpers >> 20), census.helper_count,
-                        (unsigned long long)(census.largest >> 20), census.largest_pid,
+                        (unsigned long long)(census.largest >> 20), census.largest_pid, pressure_note,
                         can_end ? "ending the game now: its helpers by SIGKILL" :
                                   "the game cannot be ended from here");
                     if (!stop_tick) stop_tick = tick;
@@ -2359,14 +2406,22 @@ void proton_run_wine()
                 say("usb: keyboards=%u mouse=%s key events=%llu mouse events=%llu", usb.keyboards,
                     usb.mouse >= 0 ? "open" : "none", (unsigned long long)usb.keys_sent,
                     (unsigned long long)usb.mouse_sent);
-            if (census_seen)
+            if (census_seen) {
+                char flexible_text[32] = "unknown";
+                if (memory_pressure_now.flexible_known)
+                    snprintf(flexible_text, sizeof(flexible_text), "%llu MiB",
+                             (unsigned long long)(memory_pressure_now.flexible_free >> 20));
                 say("Wine: system memory %llu MiB (helpers %llu MiB in %u, the largest %llu MiB in process %d), peak %llu MiB; "
-                    "%llu s of the last %u at the %u MiB limit", (unsigned long long)(census.system >> 20),
+                    "%llu s of the last %u at the %u MiB limit; guarded %llu MiB, direct used %llu MiB, flexible free %s",
+                    (unsigned long long)(census.system >> 20),
                     (unsigned long long)(census.helpers >> 20), census.helper_count,
                     (unsigned long long)(census.largest >> 20), census.largest_pid,
                     (unsigned long long)(census_peak.system >> 20),
                     (unsigned long long)(pw_memory_guard_pressure_ms(&memory_guard) / 1000),
-                    PW_MEMORY_GUARD_WINDOW_MS / 1000, memory_limit);
+                    PW_MEMORY_GUARD_WINDOW_MS / 1000, memory_limit,
+                    (unsigned long long)(memory_pressure_now.guarded >> 20),
+                    (unsigned long long)(memory_pressure_now.direct_used >> 20), flexible_text);
+            }
 #ifdef PS5_GPU_BROKER
             if (shown_last_ms)
                 say("Wine: frames shown %llu in 10 s, longest gap %llu ms, %u gaps of 100 ms or more; foreground process %d",

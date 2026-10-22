@@ -140,8 +140,17 @@ is applied. Title PRXs do not import the private allocator.
 Reservations stay virtual until committed. Commit, zeroing, decommit and release
 use the direct-memory mapper. The payload SDK supplies executable-memory callbacks.
 `WINE_PS5_PAYLOAD_DMEM=0` selects the old system-memory path for diagnostics;
-the guard test deliberately uses it. Native modules/bootstrap and some shared
-transport still consume system memory, so the memory guard remains enabled.
+the guard test deliberately uses it. A private anonymous mapping with no address,
+in a helper whose application allocator is on, is given its own direct-memory
+region (`pw_wine_anon_fresh_direct`). Executable mappings stay on flexible memory:
+the kernel drops execute from direct memory, and code runs from JIT copies.
+Native modules, bootstrap, JIT copies and some shared transport still consume
+flexible memory, so the memory guard remains enabled. It is fed the resident
+census minus direct-memory growth since the start (`src/pw_memory_policy.h`),
+and it still acts when flexible memory is nearly exhausted or the raw census
+passes its backstop. A session sets the limit in `/data/ps5proton/memory.conf`
+or the title's environment; a program's own environment does not reach the title
+when the desktop launched it.
 
 **Direct memory shared between processes.** A direct-memory range belongs to the process that allocated it; another process's
 `sceKernelMapDirectMemory` fails with EACCES until the owner grants its pid with `sceKernelProtectDirectMemoryForPID(offset, length,

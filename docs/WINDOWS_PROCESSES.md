@@ -139,8 +139,22 @@ opt-out is no longer implemented by the production process adapter. Historical
 Sony probes/build tools remain separate from the shipped payload route.
 
 The system-memory guard stays enabled because application backing does not remove
-all system-pool consumption. Closing under synthetic pressure passed in the latest
-gate. Do not equate a bounded clean close with crash recovery or unlimited stability.
+all system-pool consumption. JIT copies, native modules and some shared transport
+still use flexible memory. The guard's input is the resident census minus
+direct-memory growth since the session's start (`src/pw_memory_policy.h`), so a
+helper that commits the application pool is not, by that growth alone, treated as
+exhausting the flexible pool. Flexible free at or below 96 MiB, or a raw resident
+census at or above 6144 MiB (or the session's limit, when that is higher), still
+ends a program. `PROTON_SYSTEM_MEMORY_RAW=1` feeds the raw census. Closing under
+synthetic pressure passed in the latest gate, on the older input. Do not equate a
+bounded clean close with crash recovery or unlimited stability.
+
+A session sets `PROTON_SYSTEM_MEMORY_LIMIT` and `PROTON_SYSTEM_MEMORY_END` in
+`/data/ps5proton/memory.conf` (one `KEY=value` per line, `#` comments) or in the
+title's environment. The environment wins. `0` turns the guard off, including the
+flexible-pool floor and the raw-census backstop. A value above the firmware
+default is kept. A program launched from the desktop does not change the title's
+guard by its own `game.json`.
 
 Open targets: complete operation of a game launcher; current-build Java-launcher chain;
 fresh-prefix Zink staging; broader concurrent graphics/audio workloads; refresh of

@@ -2,7 +2,10 @@
 /* The console side of pw_wine_dmem, linked into ntdll.prx: libkernel's
  * direct memory behind the mmap, munmap and mprotect calls of ntdll's
  * virtual memory manager (patch 0600 routes them here), for the address
- * ranges it reserves up front. Everything else passes straight through.
+ * ranges it reserves up front. A private anonymous mapping with no address,
+ * once the application allocator is on, is given a direct-memory region of
+ * its own (pw_wine_anon_fresh_direct). A fixed address outside a region, and
+ * every executable mapping, still passes straight through.
  *
  * The recipe is the one ps5-xash3d's heap runs on (FW 12.02): main direct
  * memory, mapped read-write at a fixed address over a reservation, then
@@ -1014,6 +1017,32 @@ static int refuse_foreign(PwWineDmem *engine, uintptr_t at, uintptr_t end)
     return 0;
 }
 
+/* A private anonymous mapping the caller did not place: the kernel chooses the address, the range is enrolled,
+ * and direct memory backs it when the protection asks for access. PROT_NONE stays a reservation. A failure leaves
+ * nothing enrolled and the caller takes the flexible path. */
+static void *anon_direct_place(size_t bytes, int protection)
+{
+    void *at = NULL;
+    static unsigned reported, fallen;
+
+    if (!bytes || sceKernelReserveVirtualRange(&at, bytes, 0, PAGE) || !at) return MAP_FAILED;
+    if (pw_wine_dmem_add_region(&dmem, (uintptr_t)at, bytes, 1)) {
+        (void)sceKernelMunmap(at, bytes);
+        if (fallen++ < 4)
+            fprintf(stderr, "wine-ps5: anonymous mapping of %zu bytes stays on flexible memory (regions %u)\n",
+                    bytes, dmem.regions);
+        return MAP_FAILED;
+    }
+    if ((protection & 7) && pw_wine_dmem_replace(&dmem, (uintptr_t)at, bytes, (unsigned)protection & 7)) {
+        (void)pw_wine_dmem_unmap(&dmem, (uintptr_t)at, bytes);
+        return MAP_FAILED;
+    }
+    if (reported++ < 4)
+        fprintf(stderr, "wine-ps5: private anonymous mapping with no address takes direct memory (%zu bytes at %p)\n",
+                bytes, at);
+    return at;
+}
+
 void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, int fd, off_t offset)
 {
     uintptr_t at = page_down(address), end = at + page_span(address, bytes);
@@ -1054,6 +1083,15 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
         refused_range("mmap", address, bytes, protection);
         if (errno != EEXIST) errno = ENOMEM;
         return MAP_FAILED;
+    }
+    /* Helpers' Windows commits land in a region Wine reserved. A private anonymous mapping with no address
+     * (the Unix side, and an allocator that maps a pool and commits it later) used to be flexible memory.
+     * With the application allocator it takes a direct-memory region. Executable and fixed mappings do not. */
+    if (payload_allocate_direct && state > 0 &&
+        pw_wine_anon_fresh_direct(!!(flags & MAP_ANON), !!(flags & MAP_PRIVATE), !!(flags & MAP_SHARED),
+                                  !!(flags & MAP_FIXED), !!(protection & PROT_EXEC))) {
+        void *placed = anon_direct_place(page_span(address, bytes), protection);
+        if (placed != MAP_FAILED) return placed;
     }
     if (state <= 0 || !(flags & MAP_FIXED) || (uintptr_t)address != at ||
         (!pw_wine_dmem_split(&dmem, at, end - at, &piece) && piece == end - at))

@@ -24,7 +24,10 @@
  * helpers (the Pro, 2026-10-20). Counting it once is not safe: a build that did let a launcher's census reach
  * about 1000 MiB, and SceShellCore's VM Stats read RSS up to 1081 MiB with swap-out going from 38 to 139 MiB, where
  * the census as it is ended the launcher at 872-900 MiB with swap-out flat (the Pro, 2026-10-20; records kept off the tree: they name the launcher).
- * The raw census is what tracks the console's pressure.
+ * The raw census is what tracked the console's pressure when the pages were flexible memory. Direct-memory growth is
+ * subtracted before this guard sees the number (src/pw_memory_policy.h): a session can commit several GiB of the
+ * application pool without that growth, by itself, crossing these marks. The flexible pool and a raw-census backstop
+ * are still watched. No console run of that subtraction is on record.
  */
 #ifndef PW_MEMORY_GUARD_H
 #define PW_MEMORY_GUARD_H
