@@ -33,6 +33,7 @@
 #include "../../src/pw_log_sessions.h"
 #if !defined(PS5_HOST_REFERENCE)
 #include "../../native/proton_wine.h"
+#include "../../native/pw_usb_input_ps5.h"
 #if defined(PS5_CHILD_PROBE)
 #include "../../native/proton_child_probe.h"
 #endif
@@ -315,6 +316,14 @@ int main(int argc, char **argv)
 	const int devConf = pw_first_run_dev_conf("/data/homebrew/dev.conf");
 	const int dataFolder = mkdir(PROTON_DATA_ROOT, 0777) == 0 ? 0 : errno;
 	const int logsFolder = mkdir(PROTON_DATA_ROOT "/logs", 0777) == 0 ? 0 : errno;
+#endif
+#if !defined(PS5_HOST_REFERENCE)
+	/* libSceKeyboard and libSceMouse, once, before elevation. After the /data grant sceSysmoduleLoadModule is
+	 * refused (0x80020063 on firmware 12.20) and the later open reuses these handles. This is still the only
+	 * thread: the daemon rejects a target that has more, and this load starts none of the title's. say() here
+	 * is kept in the title folder (title-early.log); the session log repeats the same lines. sce_sys/param.json
+	 * does not name either library. */
+	pw_usb_input_ps5_preload([](const char *line) { say("%s", line); });
 #endif
 	const bool data = proton_data_grant(retried);
 	say("elevation: granted=%d status=%s uid=%d note=%s", (int)data, proton_data_status(), (int)getuid(), proton_data_note());

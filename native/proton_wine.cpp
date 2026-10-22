@@ -1835,8 +1835,9 @@ void proton_run_wine()
     say("Controls: left=%s right=%s middle=%s", pw_controls_button_id(controls.button[0]),
         pw_controls_button_id(controls.button[1]), pw_controls_button_id(controls.button[2]));
     pw_controls_mouse mouse{};
-    // A USB keyboard and mouse (native/pw_usb_input_ps5.h): loaded here, after the /data grant, which needs the
-    // title single-threaded; each load and open is logged, and a device plugged in later is found within 3 s.
+    // A USB keyboard and mouse (native/pw_usb_input_ps5.h). The modules were loaded before elevation
+    // (pw_usb_input_ps5_preload in ps5/src/main.cpp). A load from here, after the /data grant, is refused
+    // (0x80020063) and the open reuses that module's handle. A device plugged in later is found within 3 s.
     PwUsbInputPs5 usb{};
     {
         int32_t user = -1;

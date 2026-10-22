@@ -24,24 +24,35 @@ static int32_t module_handle(uint16_t id)
     return -1;
 }
 
+/* sceSysmoduleLoadModule after elevation is refused (0x80020063 on firmware 12.20). The preload, run while the
+ * title was still a normal app, left the module mapped: a failed late load reuses that handle from module_handle. */
 static int32_t load(uint16_t id, int *status)
 {
+    int32_t preloaded = module_handle(id);
     *status = sceSysmoduleLoadModule(id);
+    if (*status == 0) {
+        int32_t handle = module_handle(id);
+        if (handle >= 0) return handle;
+    }
+    if (preloaded >= 0) return preloaded;
     return module_handle(id);
 }
+
+static char preload_line[2][128];
+static int preload_logged;
 
 void pw_usb_input_ps5_preload(void (*log)(const char *line))
 {
     static const struct { const char *name; uint16_t id; } modules[] = {
         {"libSceKeyboard", KEYBOARD_MODULE}, {"libSceMouse", MOUSE_MODULE}};
-    char line[128];
     for (size_t i = 0; i < sizeof(modules) / sizeof(modules[0]); i++) {
         int status;
         int32_t handle = load(modules[i].id, &status);
-        snprintf(line, sizeof(line), "usb: preload %s id=%#x status=%#x handle=%d", modules[i].name,
-                 (unsigned)modules[i].id, (unsigned)status, (int)handle);
-        say_line(log, line);
+        snprintf(preload_line[i], sizeof(preload_line[i]), "usb: preload %s id=%#x status=%#x handle=%d",
+                 modules[i].name, (unsigned)modules[i].id, (unsigned)status, (int)handle);
+        say_line(log, preload_line[i]);
     }
+    preload_logged = 1;
 }
 
 static void open_keyboard(PwUsbInputPs5 *usb)
@@ -66,6 +77,8 @@ static void open_keyboard(PwUsbInputPs5 *usb)
                               (int)module, (unsigned)status, (unsigned)init_rc, (int)usb->user);
         for (int i = 0; i < PW_USB_INPUT_KEYBOARDS && at < sizeof(line); i++)
             at += (size_t)snprintf(line + at, sizeof(line) - at, "%s%#x", i ? "," : "", (unsigned)usb->keyboard[i]);
+        if (status && module >= 0 && at < sizeof(line))
+            snprintf(line + at, sizeof(line) - at, " preloaded");
         say_line(usb->log, line);
     }
     usb->keyboard_logged = !usb->keyboards;
@@ -92,9 +105,9 @@ static void open_mouse(PwUsbInputPs5 *usb)
     }
     if (handle >= 0) usb->mouse = handle;
     if (handle >= 0 || !usb->mouse_logged) {
-        snprintf(line, sizeof(line), "usb: mouse module=%d load=%#x init=%#x open=%#x merged=%u user=%d",
+        snprintf(line, sizeof(line), "usb: mouse module=%d load=%#x init=%#x open=%#x merged=%u user=%d%s",
                  (int)module, (unsigned)status, (unsigned)init_rc, (unsigned)handle, (unsigned)param[0],
-                 (int)usb->user);
+                 (int)usb->user, status && module >= 0 ? " preloaded" : "");
         say_line(usb->log, line);
     }
     usb->mouse_logged = handle < 0;
@@ -107,6 +120,10 @@ void pw_usb_input_ps5_open(PwUsbInputPs5 *usb, int32_t user, void (*log)(const c
     usb->mouse = -1;
     for (int i = 0; i < PW_USB_INPUT_KEYBOARDS; i++) usb->keyboard[i] = usb->keyboard_reads[i].connected = -1;
     usb->log = log;
+    /* The preload ran before /data existed, so those say() lines are in title-early.log. Repeat them once the
+     * session log is the sink. */
+    if (preload_logged)
+        for (int i = 0; i < 2; i++) say_line(log, preload_line[i]);
     open_keyboard(usb);
     open_mouse(usb);
 }
