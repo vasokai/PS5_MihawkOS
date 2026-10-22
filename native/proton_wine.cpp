@@ -542,6 +542,47 @@ void wait_for_ended_helpers()
     if (title_log_fd >= 0) fsync(title_log_fd);
 }
 
+// One prefix sync at a time. sync() walks every dirty page on /data; a download can make that seconds, so the
+// 30 s path runs it off this loop. A second request while one is in flight is skipped, not piled up.
+std::atomic<int> prefix_sync_running{0};
+
+// The wineserver fsyncs each hive before renaming it (patch 0886) and does not fsync the prefix directory, so a
+// power loss can still drop the rename. fsync of the directory publishes user.reg, system.reg and userdef.reg.
+// Credential Manager lives in user.reg. crypt32 is unpatched: its DPAPI master key is that hive and the files
+// under drive_c/users/Mihawk/AppData (Microsoft/Protect, Microsoft/Crypto). Battle.net.config is one of those
+// files. /data is nullfs on bfs and is not mounted synchronous, so a hard reboot drops pages the kernel has not
+// written back. wait_files syncs them before LoadExec; otherwise a background sync does.
+void save_prefix(const char *why, bool wait_files)
+{
+    int registry = -1;
+    unsigned long long took_ms = 0;
+    if (flush_registry) {
+        const uint64_t start = sceKernelGetProcessTime();
+        registry = flush_registry(3000);
+        took_ms = (sceKernelGetProcessTime() - start) / 1000;
+    }
+    if (!session_prefix.empty()) {
+        const int fd = open(session_prefix.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            fsync(fd);
+            close(fd);
+        }
+    }
+    if (wait_files) {
+        sync();
+        say("Wine: prefix saved (%s): registry %s in %llu ms, files synced", why,
+            !flush_registry ? "not asked" : registry ? "NOT saved" : "saved", took_ms);
+        return;
+    }
+    if (flush_registry && (registry || took_ms >= 250))
+        say("Wine: registry %s in %llu ms (%s)", registry ? "NOT saved" : "saved", took_ms, why);
+    if (prefix_sync_running.exchange(1)) return;
+    std::thread([]() {
+        sync();
+        prefix_sync_running.store(0, std::memory_order_release);
+    }).detach();
+}
+
 // reason: why the session failed, shown by the launcher (ProtonLaunch::ended); null for an ordinary end.
 void return_to_launcher(const char *reason)
 {
@@ -590,14 +631,10 @@ void return_to_launcher(const char *reason)
             say("Wine: a grain still held the audio sink; the port goes with the process");
         }
     }
-    // The prefix's registry goes to disk before LoadExec replaces the process,
-    // whether the game ended or the title stops it (patch 0886).
-    if (flush_registry) {
-        const uint64_t start = sceKernelGetProcessTime();
-        const int status = flush_registry(3000);
-        say("Wine: registry %s in %llu ms", status ? "NOT saved" : "saved",
-            (unsigned long long)((sceKernelGetProcessTime() - start) / 1000));
-    }
+    // The prefix's registry, then its files, before LoadExec replaces the process.
+    // Credential Manager is user.reg. Battle.net's settings and crypt32's DPAPI
+    // master key are ordinary files under drive_c; /data is not mounted synchronous.
+    save_prefix("session end", true);
     // Last, after every bounded step above: replacing the title while a program's threads still ran powered the
     // console off (2026-10-03), so a helper sent SIGKILL is waited for here, for as long as it takes. Claimed here if no
     // one has: a SIGKILL sent after this check would not be waited for.
@@ -637,7 +674,11 @@ __attribute__((format(printf, 1, 2))) void fail(const char *format, ...)
 // what it calls takes only child_lock (pw_ps5_end_spawns, pw_ps5_helpers), never held across a wait.
 bool end_helpers(const char *why)
 {
-    if (!list_helpers || ending.exchange(true)) return false;
+    if (!list_helpers) return false;
+    // SIGKILL of the helpers is what a full memory session freezes on. The registry has to be on disk first:
+    // return_to_launcher's save runs only after those helpers are gone, and a freeze never gets there.
+    save_prefix("before helpers are ended", false);
+    if (ending.exchange(true)) return false;
     if (end_spawns) end_spawns();
     int pids[PW_HANG_MAX_HELPERS];
     const unsigned count = list_helpers(pids, PW_HANG_MAX_HELPERS, nullptr);
@@ -2199,20 +2240,12 @@ void proton_run_wine()
             }
         }
 #endif
-        // The registry goes to disk every 30 s, as it would on Windows, where a program's setup is kept even when the
-        // session is cut short. The wineserver saves only when its last process ends (patch 0886 adds the title's
-        // request), so a session that was ended from outside (the memory guard, the PS button, a crash) lost
-        // everything it wrote: a launcher ran its DirectX and Visual C++ install scripts again in the next session
-        // because their markers had never reached the disk (runprocess_log.txt: two full runs, 2026-10-10 21:00 and
-        // 21:22). A clean registry is skipped by the server, so the request costs nothing when nothing changed.
-        if (tick && tick % 3750 == 0 && flush_registry) {
-            const uint64_t begin = sceKernelGetProcessTime();
-            const int status = flush_registry(3000);
-            const uint64_t took_ms = (sceKernelGetProcessTime() - begin) / 1000;
-            if (status || took_ms >= 250)
-                say("Wine: registry %s in %llu ms (every 30 s)", status ? "NOT saved" : "saved",
-                    (unsigned long long)took_ms);
-        }
+        // The registry goes to disk every 30 s, and a background sync pushes the prefix's files with it. The
+        // wineserver saves only when its last process ends (patch 0886 adds the title's request) and the in-process
+        // server never exits, so a session cut short from outside used to lose everything since the previous save.
+        // A clean registry is skipped by the server. The file sync does not run on this loop: /data writeback of a
+        // download can take seconds.
+        if (tick && tick % 3750 == 0) save_prefix("every 30 s", false);
         // The census is read every half second, guard or not: the hang breaker goes by its age. A read that fails (the
         // helper was writing it) keeps the last whole one; the copy it was given may be torn (src/pw_memory_helper.c).
         bool census_read = false;

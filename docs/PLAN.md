@@ -1,5 +1,11 @@
 # Plan
 
+## Battle.net's login does not survive a reopened session (2026-10-22, no console run)
+
+The `mihawk` prefix is `/data/ps5proton/prefixes/mihawk` (`WINEPREFIX`). `/data` is a nullfs over `/user/data`, bfs on `ssd0.user`, not a tmpfs and not mounted synchronous. The title creates that folder only when `system.reg` is missing. It mkdir's the Mihawk profile folders and leaves an existing one (`EEXIST`). The steamuser move runs once, marked by `.pw-profile-user`. `pw_wine_prefix_prepare` copies runtime files into `windows` and does not touch `user.reg`, `system.reg`, or `AppData`.
+
+The in-process wineserver never exits, so it does not save on its own at the last process. The title already asks it to (patch 0886) every 30 s and on the way back to the launcher, and the hive file is fsynced before the rename. That save used to run only after helper SIGKILL, inside `return_to_launcher`, so a freeze during the kill left the hive in memory. The directory of the rename was not fsynced. Credential Manager is `user.reg` (`HKCU\Software\Wine\Credential Manager`); crypt32 is unpatched, so a DPAPI master key is that hive and the files under `drive_c/users/Mihawk/AppData`. Battle.net's own settings are `AppData\Roaming\Battle.net\Battle.net.config`. With "Keep me logged in" off, Battle.net does not ask Windows to store the token. `native/proton_wine.cpp` now flushes the registry before SIGKILL, fsyncs the prefix directory, syncs file data before LoadExec, and starts that file sync in the background every 30 s. Not run on a console.
+
 ## Flexible pressure and anonymous direct memory (2026-10-22, no console run)
 
 A firmware 12.20 title log showed the resident census (the guard's old input) climb from 944 MiB to 1601 MiB in about
