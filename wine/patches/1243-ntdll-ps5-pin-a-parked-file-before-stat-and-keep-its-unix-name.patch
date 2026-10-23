@@ -19,9 +19,7 @@ process, naming the syscall, the info class and the handle type. Logging
 only. No console run; tests/test_pw_file_query.c covers the three decisions.
 ---
 --- a/dlls/ntdll/unix/file.c
-
 +++ b/dlls/ntdll/unix/file.c
-
 @@ -3668,6 +3668,7 @@
  
  #ifdef __PROSPERO__
@@ -127,9 +125,7 @@ only. No console run; tests/test_pw_file_query.c covers the three decisions.
  }
  
 --- a/server/fd.c
-
 +++ b/server/fd.c
-
 @@ -2028,13 +2028,22 @@
      fd->user   = user;
  }
@@ -253,9 +249,7 @@ only. No console run; tests/test_pw_file_query.c covers the three decisions.
      }
  }
 --- a/server/file.c
-
 +++ b/server/file.c
-
 @@ -156,19 +156,56 @@
      default_fd_reselect_async     /* reselect_async */
  };

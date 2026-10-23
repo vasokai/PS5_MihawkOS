@@ -1,0 +1,255 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: post NtSetIoCompletion onto the port Windows would use
+
+WoW Classic Era and Classic beta fault in RtlTimeToTimeFields reading
+0x00000000C0000024. The installed tracer (patch 1244) named the returns.
+Both caller addresses sit in ntdll.dll syscall thunks (base 0xDFFFF40000):
+NtWriteFile at +0x5565F, NtDeviceIoControlFile at +0x5563F, NtSetIoCompletion
+at +0x5727F. The fault is ntdll+0x65903. The 68 NtWriteFile returns and the
+2 NtDeviceIoControlFile returns are GoogleUpdater, Battle.net.exe and
+Agent.exe. The two processes that wrote Crash.txt, WowClassic.exe and
+WowB.exe, returned 0xC0000024 only from NtSetIoCompletion, five times each,
+immediately after the loader and a powrprof unload.
+
+NtSetIoCompletion has no IO_STATUS_BLOCK. A 32-bit store of that status into
+a zeroed pointer-sized slot is the pointer RtlTimeToTimeFields reads.
+Windows accepts an IoCompletion and returns ACCESS_DENIED when the access is
+wrong. A second image of this server has another completion_ops and the same
+type name, so the name is accepted and the access is checked. If ntsync
+cannot allocate the port's event, the port is still created, with the
+in-memory event Wine uses without ntsync.
+
+A file, pipe or device that CreateIoCompletionPort already bound is posted
+to that port. Windows would return STATUS_OBJECT_TYPE_MISMATCH for that
+handle. That status is the value the loader stored. An event, a section and
+a file with no bound port still return the mismatch. The tracer stays, and
+now also records the handle (r10), the guest caller at [rsp], and the server
+type name. No console run.
+---
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 02737cb..a2977b1 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -8966,6 +8966,36 @@ NTSTATUS WINAPI unixcall_compat_wine_nt_to_unix_file_name( void *args )
+ }
+ 
+ #ifdef __PROSPERO__
++/* Object type name for the 0xC0000024 line. ASCII, empty when the handle has
++ * no type. get_object_type takes any object, so this call does not itself
++ * return STATUS_OBJECT_TYPE_MISMATCH. */
++void ps5_mismatch_type( unsigned long long handle, char *out, size_t n )
++{
++    char buffer[sizeof(struct object_type_info) + 64];
++    struct object_type_info *info = (struct object_type_info *)buffer;
++    const WCHAR *chars;
++    unsigned int status, i, count;
++
++    if (!out || !n) return;
++    out[0] = 0;
++    if (!handle) return;
++    memset( buffer, 0, sizeof(buffer) );
++    SERVER_START_REQ( get_object_type )
++    {
++        req->handle = wine_server_obj_handle( (HANDLE)(ULONG_PTR)handle );
++        wine_server_set_reply( req, buffer, sizeof(buffer) );
++        status = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    if (status || info->name_len < sizeof(WCHAR)) return;
++    chars = (const WCHAR *)(info + 1);
++    count = info->name_len / sizeof(WCHAR);
++    if (count > 31) count = 31;
++    for (i = 0; i < count && i + 1 < n; i++)
++        out[i] = (chars[i] >= 32 && chars[i] < 127) ? (char)chars[i] : '?';
++    out[i] = 0;
++}
++
+ /* What a process spends in the file calls that a program waits on: reads, opens (NtCreateFile and NtOpenFile), attribute
+  * and directory queries, per kind the calls, nanoseconds, the slowest call and the bytes a read returned. The console's
+  * disk is slow for small writes (patch 1006), and a HashLink game in an emulator took minutes to reach its menu with every
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 26d1705..d70dc84 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -3077,13 +3077,26 @@ static const char *ps5_syscall_name( unsigned int id )
+     return NULL;
+ }
+ 
++/* The server type name, ASCII. Empty when the handle has none. file.c. */
++extern void ps5_mismatch_type( unsigned long long handle, char *out, size_t n );
++
++/* [rsp] after the entry pop is the return address of whoever called the thunk. */
++static unsigned long long ps5_guest_caller( unsigned long long rsp )
++{
++    if (!rsp || (rsp & 7)) return 0;
++    return *(volatile unsigned long long *)(ULONG_PTR)rsp;
++}
++
+ /* Called from __wine_syscall_dispatcher_return with the status still in rax.
+  * caller is frame->rip, which the prolog already moved 0xb below the guest return.
+- * The sink can re-enter a syscall; depth stops that from logging itself. */
+-void ps5_note_type_mismatch( UINT id, ULONG_PTR arg2, ULONG_PTR caller )
++ * handle is r10 saved at entry. guest_rsp is frame->rsp. The sink can re-enter a
++ * syscall; depth stops that from logging itself, including the type query. */
++void ps5_note_type_mismatch( UINT id, ULONG_PTR arg2, ULONG_PTR caller,
++                             ULONG_PTR handle, ULONG_PTR guest_rsp )
+ {
+     static unsigned int depth, lines;
+-    char line[192];
++    char line[256];
++    char type[40];
+     int len;
+ 
+     if (__atomic_fetch_add( &depth, 1, __ATOMIC_RELAXED ))
+@@ -3093,9 +3106,14 @@ void ps5_note_type_mismatch( UINT id, ULONG_PTR arg2, ULONG_PTR caller )
+     }
+     if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) < 48)
+     {
++        type[0] = 0;
++        ps5_mismatch_type( (unsigned long long)handle, type, sizeof(type) );
+         len = pw_status_mismatch_line( line, sizeof(line), ps5_syscall_name( id ), id,
+                                        (unsigned long long)arg2,
+-                                       (unsigned long long)caller + 0xb );
++                                       (unsigned long long)caller + 0xb,
++                                       (unsigned long long)handle,
++                                       ps5_guest_caller( (unsigned long long)guest_rsp ),
++                                       type );
+         if (len > 0)
+             wine_write_stderr( line, len < (int)sizeof(line) ? len : (int)sizeof(line) - 1 );
+     }
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 0207149..441ca79 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -4029,6 +4029,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "movq %rbx,0x08(%rcx)\n\t"
+                    __ASM_CFI_REG_IS_AT1(rbx, rcx, 0x08)
+                    "movq %rdx,0x18(%rcx)\n\t"
++                   "movq %r10,0x40(%rcx)\n\t"      /* first argument; the callee clobbers r10 */
+                    "movq %rsi,0x20(%rcx)\n\t"
+                    __ASM_CFI_REG_IS_AT1(rsi, rcx, 0x20)
+                    "movq %rdi,0x28(%rcx)\n\t"
+@@ -4182,9 +4183,13 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "jne " __ASM_LOCAL_LABEL("ps5_type_mismatch_done") "\n\t"
+                    "pushq %rax\n\t"
+                    "pushq %rcx\n\t"
++                   "movq 0x40(%rcx),%r8\n\t"     /* r10 saved at entry: the handle */
++                   "movq 0x88(%rcx),%r9\n\t"     /* guest rsp after the entry pop */
+                    "movl 0xb0(%rcx),%edi\n\t"    /* frame->syscall_id */
+                    "movq 0x18(%rcx),%rsi\n\t"    /* rdx saved at entry: 2nd argument */
+                    "movq 0x70(%rcx),%rdx\n\t"    /* frame->rip, 0xb before the guest return */
++                   "movq %r8,%rcx\n\t"
++                   "movq %r9,%r8\n\t"
+                    "call " __ASM_NAME("ps5_note_type_mismatch") "\n\t"
+                    "popq %rcx\n\t"
+                    "popq %rax\n\t"
+diff --git a/server/completion.c b/server/completion.c
+index dbcf4e2..9a36254 100644
+--- a/server/completion.c
++++ b/server/completion.c
+@@ -279,7 +279,22 @@ static struct completion *create_completion( struct object *root, const struct u
+             list_init( &completion->wait_queue );
+             completion->depth = 0;
+ 
+-            if (!(completion->sync = create_internal_sync( 1, 0 )))
++            completion->sync = create_internal_sync( 1, 0 );
++#ifdef __PROSPERO__
++            /* ntsync create fails with STATUS_TOO_MANY_OPENED_FILES once the
++             * console's descriptor budget is full. The port's queue does not
++             * need that device. An in-memory event is what Wine uses without
++             * ntsync, and the handle stays an IoCompletion, which is what
++             * NtSetIoCompletion accepts on Windows. */
++            if (!completion->sync)
++            {
++                clear_error();
++                completion->sync = (struct object *)create_server_internal_sync( 1, 0 );
++                if (completion->sync)
++                    fprintf( stderr, "wine-ps5: IoCompletion sync used an in-memory event\n" );
++            }
++#endif
++            if (!completion->sync)
+             {
+                 release_object( completion );
+                 return NULL;
+@@ -295,6 +310,70 @@ struct completion *get_completion_obj( struct process *process, obj_handle_t han
+     return (struct completion *) get_handle_obj( process, handle, access, &completion_ops );
+ }
+ 
++#ifdef __PROSPERO__
++/* Same bytes as pw_type_is_iocompletion in wine/ps5/pw_wine_status.h. */
++static int ps5_name_is_completion( const struct unicode_str *name )
++{
++    data_size_t i;
++
++    if (!name || !name->str || name->len != sizeof(completion_name)) return 0;
++    for (i = 0; i < sizeof(completion_name) / sizeof(WCHAR); i++)
++        if (name->str[i] != completion_name[i]) return 0;
++    return 1;
++}
++
++/* get_completion_obj failed the ops-pointer check. A second image of this
++ * server has another completion_ops and the same type name: that object is
++ * the port Windows accepts. A file, pipe or device CreateIoCompletionPort
++ * already bound has the port in its fd; posting there is the packet the
++ * guest asked for, and returning STATUS_OBJECT_TYPE_MISMATCH makes
++ * RtlTimeToTimeFields read 0xC0000024. An event, a section, and a file
++ * with no bound port stay a mismatch, which is what Windows returns. */
++static struct completion *ps5_completion_from_handle( struct process *process, obj_handle_t handle )
++{
++    struct object *obj = get_handle_obj( process, handle, 0, NULL );
++    struct fd *fd;
++    struct completion *bound;
++    apc_param_t ignored;
++    static int bound_lines;
++
++    /* The first lookup already returned TYPE_MISMATCH, so the handle exists.
++     * Access is checked only after the type name matches: Windows reports
++     * TYPE_MISMATCH for a non-port before ACCESS_DENIED, and a file handle
++     * does not carry IO_COMPLETION_MODIFY_STATE. */
++    if (!obj) return NULL;
++    if (obj->ops->type && ps5_name_is_completion( &obj->ops->type->name ))
++    {
++        release_object( obj );
++        obj = get_handle_obj( process, handle, IO_COMPLETION_MODIFY_STATE, NULL );
++        if (!obj) return NULL;
++        clear_error();
++        fprintf( stderr, "wine-ps5: NtSetIoCompletion handle=%08x accepted by type name\n", handle );
++        return (struct completion *)obj;
++    }
++    fd = obj->ops->get_fd ? get_obj_fd( obj ) : NULL;
++    if (fd)
++    {
++        bound = fd_get_completion( fd, &ignored );
++        release_object( fd );
++        if (bound)
++        {
++            clear_error();
++            if (bound_lines < 16)
++            {
++                bound_lines++;
++                fprintf( stderr, "wine-ps5: NtSetIoCompletion handle=%08x posted to bound port\n", handle );
++            }
++            release_object( obj );
++            return bound;
++        }
++    }
++    release_object( obj );
++    set_error( STATUS_OBJECT_TYPE_MISMATCH );
++    return NULL;
++}
++#endif
++
+ void add_completion( struct completion *completion, apc_param_t ckey, apc_param_t cvalue,
+                      unsigned int status, apc_param_t information )
+ {
+@@ -359,6 +438,10 @@ DECL_HANDLER(add_completion)
+     struct completion* completion = get_completion_obj( current->process, req->handle, IO_COMPLETION_MODIFY_STATE );
+     struct reserve *reserve = NULL;
+ 
++#ifdef __PROSPERO__
++    if (!completion && get_error() == STATUS_OBJECT_TYPE_MISMATCH)
++        completion = ps5_completion_from_handle( current->process, req->handle );
++#endif
+     if (!completion) return;
+ 
+     if (req->reserve_handle && !(reserve = get_completion_reserve_obj( current->process, req->reserve_handle, 0 )))

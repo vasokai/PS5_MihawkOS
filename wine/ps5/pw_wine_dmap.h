@@ -32,9 +32,11 @@ void pw_wine_dmap_init(const PwWineDmapOps *ops);
 /* 1 when fd's section is in direct memory, 0 when it is a file, -1 when that could not be learnt. */
 int pw_wine_dmap_direct(int fd);
 /* Map [address, +bytes) of the view at section offset offset from direct memory, a chunk at a time. Only for a file
- * pw_wine_dmap_direct said 1 for. 0, or -1 with errno: the title's (the range not yet touched by this call is as it
- * was), EIO when its answer does not hold the offset, or ENXIO when the kernel refused the mapping (that range may
- * have lost its reservation). Pieces mapped before the failure stay mapped. */
+ * pw_wine_dmap_direct said 1 for. Each piece is widened to the 16 KiB host pages it touches, still inside its chunk:
+ * the kernel refuses a 4 KiB direct mapping (0x80020016). An aligned piece is passed through unchanged. 0, or -1
+ * with errno: the title's (the range not yet touched by this call is as it was), EINVAL when the host pages do not
+ * fit the chunk, EIO when its answer does not hold the offset, or ENXIO when the kernel refused the mapping (that
+ * range may have lost its reservation). Pieces mapped before the failure stay mapped. */
 int pw_wine_dmap_map(int fd, uintptr_t address, size_t bytes, uint64_t offset);
 /* The chunk holding offset of fd's section (pw_wine_dmap_direct said 1): remembered, else asked of the title as a fault
  * does. 0 with its direct memory, its offset in the section and its size; -1 with errno: EINVAL (not such a section),

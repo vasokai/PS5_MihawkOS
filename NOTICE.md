@@ -26,6 +26,29 @@ LGPL-2.1-or-later and is the origin of the PS5 platform work this project builds
   XInput mapping, the `/data` mount and the one-game-per-process launcher — comes from
   its `docs/WINE_PS5_BUILD.md` and `docs/ARCHITECTURE.md`.
 
+## Syscall dispatcher page and WoW loader name
+
+[ps5-forever](https://github.com/bizkut/ps5-forever) (bizkut, GPL-3.0-or-later) pins
+[ps5-forever-wine](https://github.com/bizkut/ps5-forever-wine) at
+`ee64b784239b73f4ff7aa30adc8b3dcd1966ded0` (`ps5/release/deps.json`, content
+SHA-256 `d465aa69e0625f57591634e1a0ffe753c329d13f1f7c089b2d39dafd12761453`,
+describe `wine-8.0-21023-forever-01.000.021`). That Wine tree is
+LGPL-2.1-or-later. Patch 1260 takes two pieces from it:
+
+- `include/wine/asm.h` names the x64 syscall dispatcher `0x7ffe4000` when
+  `__WINE_PS5__` or `__PROSPERO__` is set, and `dlls/ntdll/unix/signal_x86_64.c`
+  maps that host page. The thunk keeps Wine's `0f 05` and `jmp`. It does not
+  use `int 2e`.
+- `wine_ps5_title_game_image` recognizes a drive-qualified `Wow*.exe` by a
+  sibling `<stem>_loader.dll`, then a lowercase basename. The copy in
+  `wine/ps5/pw_wow_loader.h` is GPL-3.0-or-later with the rest of `wine/ps5`.
+  This tree has no `game_launch` callback, so process creation logs the match
+  and continues the helper spawn.
+- Patch 1262 takes `SfcIsFileProtected` from commit `30a046a245c2` in that
+  Wine tree. The stub returns `FALSE` and does not call `SetLastError` or the
+  debug helpers. `SfcIsKeyProtected` no longer formats its arguments with
+  `debugstr_w`. Patch 1261's `#GP(0)` memory-operand decoder is local.
+
 The runtime adapters are pinned to upstream revision
 `c8a2f00137fb0a95f88541252b4e47f53f9677e6`; `wine/ps5/pw_ws2_32_libc.c` and
 `tests/test_pw_ws2_32_libc.c` were taken again at `d1ca1e597648f28e1f1d9c55f7d7ba9b1f0a0690` (prospero-win's
@@ -562,6 +585,16 @@ Never shipped: the distribution's `d3dcompiler_47.dll` (Microsoft's), `vulkan-1.
 `vk_swiftshader.dll` and its ICD file, `dxcompiler.dll`, `dxil.dll`, the other locales and `chrome_200_percent.pak`.
 `tools/fetch-cef.py` unpacks the first four into `.deps` only, for host experiments (docs/MIHAWK_BROWSER.md decision
 5); no build or stage step copies them.
+
+## Windows syscall numbers
+
+`tools/syscall-numbers/` holds three name-to-number maps used by `tools/check-syscall-numbers.py`:
+Windows 10 build 19045 (22H2) x64 ntoskrnl, the same build's x86 ntoskrnl, and the same build's x64
+win32k. They were taken on 2026-10-23 from the columns `Windows 10 (22H2)` of
+[j00ru/windows-syscalls](https://github.com/j00ru/windows-syscalls) `nt64.csv`, `nt32.csv` and
+`win32k64.csv`. That repository published no licence file on that date. The files here are the
+syscall name and its number, which is the Windows ABI for that build, and nothing else from the
+repository. They are the oracle for the host check. They are not linked into a title.
 
 ## Trademarks
 

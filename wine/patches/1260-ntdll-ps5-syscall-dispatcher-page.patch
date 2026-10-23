@@ -1,0 +1,385 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: call the syscall dispatcher at 0x7ffe4000
+
+ps5-forever-wine ee64b784 (bizkut/ps5-forever, deps.json pin
+d465aa69e0625f57591634e1a0ffe753c329d13f1f7c089b2d39dafd12761453)
+builds the x64 Nt* thunk as Wine's form and names the dispatcher
+0x7ffe4000, the next 16 KiB host page after KUSER_SHARED_DATA.
+SystemCall stays 1, so the thunk's 0f 05 is not executed. int 2e is
+not part of that stub.
+
+The stock PE still has call [0x7ffe1000]. After the signal handlers
+exist, and only when anon_mmap_fixed(0x7ffe4000, 0x4000) returns that
+address, each immediate 00 10 fe 7f becomes 00 40 fe 7f. A Win10 tail
+is put back on that call. A failed map leaves call [0x7ffe1000].
+The per-thread int 2e emulator stays for a fault that still executes
+those bytes. The stub repair accepts both dispatcher addresses.
+
+wine_ps5_title_game_image from the same commit recognizes a
+drive-qualified Wow*.exe when a sibling <stem>_loader.dll exists, then
+a lowercase basename (Wow.exe -> wow_loader.dll, WowB.exe stays
+WowB_loader.dll, WoWClassic.exe -> WowClassic_loader.dll). Their
+game_launch is not present here, so NtCreateUserProcess logs the leaf
+and continues the helper spawn. The predicate lives in
+wine/ps5/pw_wow_loader.h. No console run.
+---
+--- a/include/wine/asm.h
++++ b/include/wine/asm.h
+@@ -283,7 +283,17 @@
+  * Windows. For 64-bit systems the only viable form we can emulate is
+  * having an int $0x2e fallback. Since actually using an interrupt is
+  * expensive, and since for some reason Chromium doesn't actually
+- * validate that instruction, we can just put a jmp there instead. */
++ * validate that instruction, we can just put a jmp there instead.
++ * On PS5 the dispatcher pointer sits at 0x7ffe4000, the first 16 KiB
++ * boundary past the user shared data at 0x7ffe0000, rather than at
++ * 0x7ffe1000: 0x7ffe1000 shares the shared data's host page and cannot
++ * be mapped on its own (dlls/ntdll/unix/signal_x86_64.c). From
++ * bizkut/ps5-forever-wine ee64b784 include/wine/asm.h. */
++# if defined(__WINE_PS5__) || defined(__PROSPERO__)
++#  define __ASM_SYSCALL_DISPATCHER_ADDR ".long 0x7ffe4000\n\t"
++# else
++#  define __ASM_SYSCALL_DISPATCHER_ADDR ".long 0x7ffe1000\n\t"
++# endif
+ # define __ASM_SYSCALL_FUNC(id,name) \
+     __ASM_GLOBAL_FUNC( name, \
+                        __ASM_SEH(".seh_endprologue\n\t") \
+@@ -296,8 +306,8 @@
+                        ".byte 0xc3\n\t"           /* 14: ret */ \
+                        ".byte 0xeb,0x01\n\t"      /* 15: jmp 18 */ \
+                        ".byte 0xc3\n\t"           /* 17: ret */ \
+-                       ".byte 0xff,0x14,0x25\n\t" /* 18: callq *(0x7ffe1000) */ \
+-                       ".long 0x7ffe1000\n\t" \
++                       ".byte 0xff,0x14,0x25\n\t" /* 18: callq *dispatcher */ \
++                       __ASM_SYSCALL_DISPATCHER_ADDR \
+                        ".byte 0xc3" )             /* 1f: ret */
+ #elif defined __arm__
+ # define __ASM_SYSCALL_FUNC(id,name,args) \
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2282,8 +2282,9 @@
+     load_ntdll_functions( module );
+ #if defined(__PROSPERO__) && defined(__x86_64__)
+     /* Count the Win10 thunks and leave call [0x7ffe1000] in place.
+-     * signal_init_process rewrites the tail to int 2e after the handlers
+-     * exist. SystemCall stays 1: a Windows syscall number enters the kernel. */
++     * signal_init_process retargets that immediate to 0x7ffe4000 after the
++     * handlers exist. SystemCall stays 1: a Windows syscall number enters
++     * the kernel. int 2e is not installed. */
+     ps5_arm_ntdll_syscalls( module );
+ #endif
+     if (is_arm64ec()) redirect_ntdll_functions( module );
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -67,6 +67,9 @@
+ #include "winioctl.h"
+ #include "ddk/ntddk.h"
+ #include "unix_private.h"
++#ifdef __PROSPERO__
++#include "pw_wow_loader.h"
++#endif
+ #include "wine/condrv.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
+@@ -769,6 +772,36 @@
+     if (ps5_ends_with( child, services )) return ps5_env_set( env, "WINE_PS5_SERVICES=1" );
+     return TRUE;
+ }
++
++/* Sibling <stem>_loader.dll, then a lowercase basename. From
++ * bizkut/ps5-forever-wine ee64b784 wine_ps5_title_game_image. Their
++ * game_launch hands the image to a separate title runtime and returns
++ * STATUS_CANCELLED. This process has no such callback: the existing
++ * helper spawn continues, and the line only records that the predicate
++ * matched. The leaf is the Windows basename, not a filesystem path. */
++static int ps5_loader_file_exists( const char *path )
++{
++    return path && !access( path, F_OK );
++}
++
++static void ps5_note_wow_loader( const UNICODE_STRING *image, const char *unix_name )
++{
++    char dos[1024], leaf[80], line[128];
++    const char *base, *p;
++    DWORD bytes = 0;
++
++    if (!image || !image->Buffer || !image->Length || !unix_name) return;
++    if (image->Length >= sizeof(dos)) return;
++    if (RtlUnicodeToUTF8N( dos, sizeof(dos) - 1, &bytes, image->Buffer, image->Length )) return;
++    if (bytes >= sizeof(dos)) return;
++    dos[bytes] = 0;
++    if (!pw_wow_game_image( dos, unix_name, ps5_loader_file_exists )) return;
++    base = dos;
++    for (p = dos; *p; p++) if (*p == '\\' || *p == '/') base = p + 1;
++    snprintf( leaf, sizeof(leaf), "%s", base );
++    snprintf( line, sizeof(line), "wine-ps5: wow-loader image=%s recognized=1\n", leaf );
++    wine_write_stderr( line, strlen( line ) );
++}
+ #endif
+ 
+ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr,
+@@ -868,6 +901,7 @@
+         goto done;
+     }
+ #ifdef __PROSPERO__
++    ps5_note_wow_loader( &params->ImagePathName, unix_name );
+     /* Experimental Sony service loader: PE64 and, under WoW64, PE32, explicitly enabled. */
+     if (!getenv("WINE_PS5_CHILDREN") || strcmp(getenv("WINE_PS5_CHILDREN"), "1") ||
+         (getenv("WINE_PS5_CHILD") && !getenv("WINE_PS5_INITIAL_CLIENT") &&
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -716,17 +716,33 @@
+ extern void __wine_syscall_dispatcher_instrumentation(void);
+ static void *instrumentation_callback;
+ static pthread_mutex_t instrumentation_callback_mutex = PTHREAD_MUTEX_INITIALIZER;
++#ifdef __PROSPERO__
++/* bizkut/ps5-forever-wine ee64b784 maps this pointer on its own host page.
++ * The stock PE still names 0x7ffe1000 until the thunks are retargeted. */
++#define PS5_SYSCALL_DISPATCHER_PTR ((void *)0x7ffe4000)
++#define PS5_SYSCALL_DISPATCHER_PAGE 0x4000
++static int ps5_dispatcher_ready;
++#endif
+ 
+ void set_process_instrumentation_callback( void *callback )
+ {
+     void *ptr = (char *)user_shared_data + page_size;
+     sigset_t sigset;
+-    void *old;
++    void *old, *entry;
+ 
+     server_enter_uninterrupted_section( &instrumentation_callback_mutex, &sigset );
+     old = InterlockedExchangePointer( &instrumentation_callback, callback );
+-    if (!old && callback)      InterlockedExchangePointer( ptr, __wine_syscall_dispatcher_instrumentation );
+-    else if (old && !callback) InterlockedExchangePointer( ptr, __wine_syscall_dispatcher );
++    if (!old && callback) entry = __wine_syscall_dispatcher_instrumentation;
++    else if (old && !callback) entry = __wine_syscall_dispatcher;
++    else entry = NULL;
++    if (entry)
++    {
++        InterlockedExchangePointer( ptr, entry );
++#ifdef __PROSPERO__
++        if (ps5_dispatcher_ready)
++            InterlockedExchangePointer( PS5_SYSCALL_DISPATCHER_PTR, entry );
++#endif
++    }
+     server_leave_uninterrupted_section( &instrumentation_callback_mutex, &sigset );
+ }
+ 
+@@ -3536,22 +3552,19 @@
+  * call [0x7ffe1000]. That is the path process startup already ran, and it
+  * is why 1255's early int 2e left Mihawk on a black screen.
+  *
+- * After the handlers are installed, the 0x20-byte thunk matches Win10 19045:
+- * 4c 8b d1, mov eax, the shared-user test, 75 03, 0f 05, c3, cd 2e, c3,
+- * and the 8-byte nop 0f 1f 84 00 00 00 00 00. jne +3 lands on int 2e.
+- * The fault enters __wine_syscall_dispatcher at prolog_end. Nothing was
+- * pushed. An rsp already inside the thread stack is left alone, and the
+- * epilogue returns to the ret after int 2e.
+- *
+- * Every thread resumes its own int 2e. A process-wide depth counter turned
+- * the loser's #GP into an access violation at the cd 2e (1257: NtReleaseMutant
+- * 0x20 at ntdll+0x56a55, NtFsControlFile 0x39 at +0x56d75, NtContinue 0x43
+- * at +0x56eb5). The depth is per thread. The opcode is read from the page
+- * the CPU fetched, without virtual_mutex.
++ * ps5-forever-wine ee64b784 builds this same thunk and puts the dispatcher
++ * at 0x7ffe4000 (include/wine/asm.h, __WINE_PS5__). That is the next 16 KiB
++ * host page, so it is not inside KUSER_SHARED_DATA. After the handlers
++ * exist, and only when that page was mapped, each stock immediate
++ * 00 10 fe 7f becomes 00 40 fe 7f. int 2e is not installed. The 1257
++ * rewrite is what wine-child 395, 396 and 397 executed. The loader then
++ * stored 11 bytes over NtSetIoCompletion, and the leftover test immediate
++ * ran as add [rbx], al with a non-canonical rbx: #GP(0) at ntdll+0x5834b.
+  *
+- * The call-path repair stays for a thunk that still has call [0x7ffe1000]
+- * and a smashed rsp. int 0x29 is __fastfail even when the trap is not
+- * reported as an IDT error: STATUS_STACK_BUFFER_OVERRUN, code in RCX. */
++ * The per-thread int 2e emulator stays for a faulting 0f 05 or cd 2e.
++ * The call-path repair accepts call [0x7ffe1000] and call [0x7ffe4000].
++ * int 0x29 is __fastfail even when the trap is not reported as an IDT
++ * error: STATUS_STACK_BUFFER_OVERRUN, code in RCX. */
+ 
+ static void *ps5_ntdll_module;
+ static ULONG_PTR ps5_ntdll_base, ps5_ntdll_end;
+@@ -3859,7 +3872,8 @@
+         ps5_read_bytes( (void *)(rip - PS5_STUB_RET), head, sizeof(head) ) &&
+         head[PS5_STUB_RET] == 0xc3 && head[0x10] == 0x75 && head[0x11] == 0x03 &&
+         head[PS5_STUB_CALL] == 0xff && head[0x19] == 0x14 && head[0x1a] == 0x25 &&
+-        head[0x1b] == 0x00 && head[0x1c] == 0x10 && head[0x1d] == 0xfe && head[0x1e] == 0x7f &&
++        head[0x1b] == 0x00 && (head[0x1c] == 0x10 || head[0x1c] == 0x40) &&
++        head[0x1d] == 0xfe && head[0x1e] == 0x7f &&
+         !(head[0] == 0x4c && head[1] == 0x8b && head[2] == 0xd1))
+     {
+         stub = rip - PS5_STUB_RET;
+@@ -3971,8 +3985,9 @@
+ }
+ 
+ /* Leave the thunks on call [0x7ffe1000]. The line is written before the scan
+- * so a fault in the walk is still named. path=call is this process until
+- * ps5_enable_windows_thunks runs, which is after the signal handlers. */
++ * so a fault in the walk is still named. path=call at this address is this
++ * process until ps5_enable_windows_thunks retargets the immediate, which is
++ * after the signal handlers. */
+ void ps5_arm_ntdll_syscalls( void *module )
+ {
+     unsigned int syscall_sites = 0, int2e_sites = 0, systemcall;
+@@ -4009,10 +4024,12 @@
+     ps5_log_line( line );
+ }
+ 
+-/* Win10 19045's x64 thunk is 0x20 bytes. The file has eb 01 and
+- * call [0x7ffe1000] where Windows has cd 2e and an 8-byte nop. Rewrite
+- * that tail only. 0f 05 stays, and SystemCall stays 1, so jne +3 executes
+- * int 2e instead of entering the Prospero kernel. */
++/* The file has call [0x7ffe1000]. ps5-forever-wine ee64b784 compiles
++ * call [0x7ffe4000] instead, and never installs int 2e. Rewrite that
++ * immediate when the dispatcher page was mapped. A Win10 tail left by an
++ * older image is put back on the call. 0f 05 stays, and SystemCall stays
++ * 1, so jne +3 does not enter the Prospero kernel. A failed map leaves
++ * call [0x7ffe1000], which is the path Mihawk already booted. */
+ static void ps5_enable_windows_thunks(void)
+ {
+     static const BYTE wine_tail[24] = {
+@@ -4020,14 +4037,17 @@
+         0x75, 0x03, 0x0f, 0x05, 0xc3, 0xeb, 0x01, 0xc3,
+         0xff, 0x14, 0x25, 0x00, 0x10, 0xfe, 0x7f, 0xc3
+     };
++    static const BYTE call_tail[24] = {
++        0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01,
++        0x75, 0x03, 0x0f, 0x05, 0xc3, 0xeb, 0x01, 0xc3,
++        0xff, 0x14, 0x25, 0x00, 0x40, 0xfe, 0x7f, 0xc3
++    };
+     static const BYTE win_tail[24] = {
+         0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01,
+         0x75, 0x03, 0x0f, 0x05, 0xc3, 0xcd, 0x2e, 0xc3,
+         0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00
+     };
+-    static const BYTE repl[11] = {
+-        0xcd, 0x2e, 0xc3, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00
+-    };
++    static const BYTE addr[4] = { 0x00, 0x40, 0xfe, 0x7f };
+     IMAGE_DOS_HEADER *dos = ps5_ntdll_module;
+     IMAGE_NT_HEADERS *nt;
+     IMAGE_SECTION_HEADER *sec;
+@@ -4037,10 +4057,11 @@
+     BYTE shown[32];
+     char hex[72], line[400];
+     const char *sample_text = "-";
++    const char *slot = ps5_dispatcher_ready ? "0x7ffe4000" : "0x7ffe1000";
+ 
+     memset( shown, 0, sizeof(shown) );
+     hex[0] = 0;
+-    if (dos && dos->e_magic == IMAGE_DOS_SIGNATURE)
++    if (ps5_dispatcher_ready && dos && dos->e_magic == IMAGE_DOS_SIGNATURE)
+     {
+         nt = (IMAGE_NT_HEADERS *)((char *)dos + dos->e_lfanew);
+         if (nt->Signature == IMAGE_NT_SIGNATURE)
+@@ -4050,7 +4071,7 @@
+             {
+                 BYTE *start;
+                 SIZE_T size, off;
+-                void *addr;
++                void *prot_addr;
+                 ULONG old = 0;
+                 int opened = 0;
+ 
+@@ -4058,8 +4079,8 @@
+                 size = sec[i].Misc.VirtualSize;
+                 if (size < 24) continue;
+                 start = (BYTE *)dos + sec[i].VirtualAddress;
+-                addr = start;
+-                if (!NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
++                prot_addr = start;
++                if (!NtProtectVirtualMemory( NtCurrentProcess(), &prot_addr, &size,
+                                              PAGE_EXECUTE_READWRITE, &old ))
+                     opened = 1;
+                 for (off = 0; off + 24 <= sec[i].Misc.VirtualSize; )
+@@ -4073,16 +4094,29 @@
+                     if (got < 24) break;
+                     for (j = 0; j + 24 <= got; j++)
+                     {
+-                        if (!memcmp( buf + j, win_tail, sizeof(win_tail) ))
++                        if (!memcmp( buf + j, call_tail, sizeof(call_tail) ))
+                         {
+                             if (!sample) sample = (ULONG_PTR)(start + off + j) - 8;
+                             already++;
+                             j += 23;
+                             continue;
+                         }
+-                        if (memcmp( buf + j, wine_tail, sizeof(wine_tail) )) continue;
++                        if (!memcmp( buf + j, wine_tail, sizeof(wine_tail) ))
++                        {
++                            if (!opened ||
++                                virtual_uninterrupted_write_memory( start + off + j + 19, addr, sizeof(addr) ))
++                                failed++;
++                            else
++                            {
++                                if (!sample) sample = (ULONG_PTR)(start + off + j) - 8;
++                                armed++;
++                            }
++                            j += 23;
++                            continue;
++                        }
++                        if (memcmp( buf + j, win_tail, sizeof(win_tail) )) continue;
+                         if (!opened ||
+-                            virtual_uninterrupted_write_memory( start + off + j + 13, repl, sizeof(repl) ))
++                            virtual_uninterrupted_write_memory( start + off + j, call_tail, sizeof(call_tail) ))
+                             failed++;
+                         else
+                         {
+@@ -4097,9 +4131,9 @@
+                 {
+                     ULONG dummy;
+ 
+-                    addr = start;
++                    prot_addr = start;
+                     size = sec[i].Misc.VirtualSize;
+-                    NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old, &dummy );
++                    NtProtectVirtualMemory( NtCurrentProcess(), &prot_addr, &size, old, &dummy );
+                 }
+             }
+         }
+@@ -4121,9 +4155,9 @@
+     }
+     systemcall = ps5_keep_system_call();
+     snprintf( line, sizeof(line),
+-              "wine-ps5: syscall-int2e ntdll armed=%u already=%u failed=%u systemcall=%#x "
+-              "path=int2e trap=cd2e reason=syscall-collides sample=%s\n",
+-              armed, already, failed, systemcall, sample_text );
++              "wine-ps5: syscall-dispatch ntdll armed=%u already=%u failed=%u systemcall=%#x "
++              "path=call addr=%s ready=%d sample=%s\n",
++              armed, already, failed, systemcall, slot, ps5_dispatcher_ready, sample_text );
+     ps5_log_line( line );
+ }
+ #endif
+@@ -4919,6 +4953,31 @@
+         anon_mmap_fixed( ptr, page_size, PROT_READ | PROT_WRITE, 0 );
+         *(void **)ptr = __wine_syscall_dispatcher;
+     }
++#ifdef __PROSPERO__
++    /* Own host page for the retargeted thunks. MAP_FIXED replaces a
++     * reservation that only covers this page. A failure leaves the thunks
++     * on call [0x7ffe1000]. */
++    {
++        void *slot = PS5_SYSCALL_DISPATCHER_PTR;
++        void *mapped = anon_mmap_fixed( slot, PS5_SYSCALL_DISPATCHER_PAGE,
++                                        PROT_READ | PROT_WRITE, 0 );
++
++        if (mapped == slot)
++        {
++            *(void **)slot = __wine_syscall_dispatcher;
++            ps5_dispatcher_ready = 1;
++        }
++        else
++        {
++            char line[160];
++
++            snprintf( line, sizeof(line),
++                      "wine-ps5: syscall-dispatch map failed ptr=%p got=%p\n", slot, mapped );
++            ps5_log_line( line );
++        }
++    }
++#endif
++
+     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
+ 
+     if (wow_teb)

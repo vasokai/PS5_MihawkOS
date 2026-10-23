@@ -1,0 +1,94 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: make a private execute fault JIT memory
+
+An execute fault on committed private memory that Wine did not mark
+executable never reached the JIT converter. The 2be3f2a WowB process
+fetched 0x1000445a50 and 0x1000443f40 inside the 16 GiB reservation at
+0x1000000000 and exited with exec_refused 0, so that page byte had no
+execute. The host page has to be one private view, and every 4 KiB page
+in it committed and not a guard. Those pages gain execute and become
+one JIT object. A file or image view is left alone. At most eight lines
+name the address, the old page byte and the view protection.
+
+No console run.
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index d099dac..72133af 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -6134,6 +6134,57 @@ static int ps5_host_prot( const void *page )
+     return force_exec_prot && (prot & PROT_READ) ? prot | PROT_EXEC : prot;
+ }
+ 
++/* An execute fault on committed private memory Wine did not mark executable. The converter below runs only when the
++ * page byte already has execute. The 2be3f2a WowB process fetched 0x1000445a50 and 0x1000443f40, both inside the 16 GiB
++ * reservation at PS5_HIGH_BASE, and exited with exec_refused 0: that page byte has no execute, so nothing was converted.
++ * A protection loader writes the buffer read-write and then runs it. The host page has to be one private view, every
++ * 4 KiB page committed and not a guard, or the copy would take a neighbour. The pages gain execute and become one JIT
++ * object, and the instruction runs again. A file or image view is not touched. At most eight lines. The virtual mutex
++ * is held. */
++static BOOL ps5_promote_private_exec( void *addr, char *page )
++{
++    struct file_view *view = find_view( addr, 0 );
++    BYTE vprot = get_page_vprot( addr );
++    BYTE saved[16];
++    size_t i, n;
++    int prot, failed;
++    static int lines;
++
++    if (!view || !is_view_valloc( view )) return FALSE;
++    if ((char *)view->base > page || (char *)view->base + view->size < page + host_page_size) return FALSE;
++    if (!(vprot & VPROT_COMMITTED) || (vprot & VPROT_GUARD)) return FALSE;
++    if (!(vprot & (VPROT_WRITE | VPROT_WRITECOPY)) && !(view->protect & VPROT_EXEC)) return FALSE;
++
++    n = host_page_size / page_size;
++    if (!n || n > ARRAY_SIZE(saved)) return FALSE;
++    for (i = 0; i < n; i++)
++    {
++        char *p = page + i * page_size;
++        BYTE b = get_page_vprot( p );
++
++        saved[i] = b;
++        if (find_view( p, 0 ) != view) return FALSE;
++        if (!(b & VPROT_COMMITTED) || (b & VPROT_GUARD)) return FALSE;
++        if (!(b & (VPROT_READ | VPROT_WRITE | VPROT_WRITECOPY))) return FALSE;
++    }
++
++    if (lines < 8)
++    {
++        lines++;
++        fprintf( stderr, "wine-ps5: execute-fault addr=%p vprot=%#x view=%#x\n", addr, vprot, view->protect );
++    }
++    for (i = 0; i < n; i++)
++        if (!(saved[i] & VPROT_EXEC)) set_page_vprot_bits( page + i * page_size, page_size, VPROT_EXEC, 0 );
++
++    prot = get_unix_prot( get_page_vprot( addr ) );
++    failed = __wine_ps5_exec_convert( page, host_page_size, prot );
++    ps5_conversions++;
++    host_prot_record( page, host_page_size, failed ? 0 : prot | HOST_PROT_KNOWN );
++    if (!failed) return TRUE;
++    for (i = 0; i < n; i++) set_page_vprot( page + i * page_size, page_size, saved[i] );
++    return FALSE;
++}
++
+ /***********************************************************************
+  *           ps5_fault_served
+  *
+@@ -6142,7 +6193,8 @@ static int ps5_host_prot( const void *page )
+  * where the code becomes JIT memory: the faulting host page and its neighbours with the same protection, within one
+  * view and one PS5_EXEC_CLUSTER window, are copied into one JIT object (wine/ps5/pw_wine_dmem_ps5.c) and the
+  * instruction runs again. Private and image views only: a section view must stay coherent with its other views, and
+- * an execute fault there is refused and counted (virtual_handle_fault).
++ * an execute fault there is refused and counted (virtual_handle_fault). A private page that was not marked executable
++ * is marked and converted first (ps5_promote_private_exec).
+  *
+  * First, a fault the host already allows runs again: the thread faulted while another one, holding the virtual
+  * mutex, changed the page (a conversion makes its pages read-only while it copies them). This replaces patch 0954's
+@@ -6168,6 +6220,7 @@ static BOOL ps5_fault_served( void *addr, char *page, ULONG_PTR err )
+     }
+     data->ps5_granted.address = NULL;
+ 
++    if (access == PROT_EXEC && !(want & PROT_EXEC) && ps5_promote_private_exec( addr, page )) return TRUE;
+     if (access != PROT_EXEC || !(want & PROT_EXEC) || !((prot = ps5_host_prot( page )) & PROT_EXEC)) return FALSE;
+     if (!(view = find_view( addr, 0 )) || !(is_view_valloc( view ) || (view->protect & SEC_IMAGE))) return FALSE;
+     low = ROUND_ADDR( page, PS5_EXEC_CLUSTER - 1 );

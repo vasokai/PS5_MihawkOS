@@ -1,0 +1,362 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: keep the fast syscall path
+
+1255 stored KUSER_SHARED_DATA.SystemCall as 0 after rewriting every
+thunk to int 2e. Mihawk then never reached the shell: every ntdll
+syscall, including process startup, took the fault path. This build
+leaves SystemCall at 1 and the file's 0f 05 bytes in place, so an
+intact thunk still executes call [0x7ffe1000].
+
+The dispatcher repairs one case. When it is about to read the fifth
+argument, and the saved rsp is outside the thread stack, and the bytes
+at the stub are a Wine thunk whose first byte is no longer 4c 8b d1,
+it puts rsp back on the stack slot that still holds that qword and
+puts the guest rcx into r10. Mihawk, explorer and Battle.net do not
+enter that function. The int 2e emulator stays, and startup does not
+execute it.
+
+Early lines name the path before the scan and when the signal handlers
+are installed. Syscall numbers are unchanged. The compare of protocol
+0x3a3 is the same instruction. No console run.
+---
+--- a/dlls/ntdll/unix/loader.c	2026-10-23 14:47:21.889507278 +0000
++++ b/dlls/ntdll/unix/loader.c	2026-10-23 15:12:48.725897584 +0000
+@@ -2281,11 +2281,9 @@
+     free( name );
+     load_ntdll_functions( module );
+ #if defined(__PROSPERO__) && defined(__x86_64__)
+-    /* Prospero executes the PE stub's syscall instruction. cd 2e is the same
+-     * length, so it faults instead of entering the kernel. The rewrite runs
+-     * first; ps5_arm_ntdll_syscalls then stores 0 at KUSER_SHARED_DATA+0x308
+-     * so the stub takes int 2e. Guest code starts after the signal handlers
+-     * are installed, which is after this returns. */
++    /* Count the Win10 thunks and leave their syscall bytes and SystemCall
++     * bit alone, so startup takes call [0x7ffe1000]. A thunk whose first byte
++     * the loader rewrote is repaired in the dispatcher, not by int 2e. */
+     ps5_arm_ntdll_syscalls( module );
+ #endif
+     if (is_arm64ec()) redirect_ntdll_functions( module );
+
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-10-23 14:47:51.257397269 +0000
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-10-23 15:13:50.941584171 +0000
+@@ -3502,21 +3502,24 @@
+ 
+ 
+ #ifdef __PROSPERO__
+-/* 1254 was installed (e21e5c4d/a706e789, dll 63b7dab8). syscall-arm counted
+- * 258 and syscall-emu never fired. The fault is still trap 9 err 0 at
+- * ntdll+0x58354, the ret, with rsp equal to the guest return address. The
+- * stub took call [0x7ffe1000] because SystemCall was 1, so the int 2e at
+- * +0x12 did not run. The 15.45 store of 0x5c at +0 is pop rsp; that replaces
+- * rsp before the flag test. With the bit set, the call path returns to this
+- * ret and the smashed rsp is already the frame.
++/* 1255 stored SystemCall as 0 after rewriting every stub to cd 2e. Mihawk
++ * then never reached the shell: every ntdll thunk, including process startup,
++ * took int 2e. This build leaves the file's 0f 05 bytes in place and leaves
++ * KUSER_SHARED_DATA.SystemCall at 1, so jne +3 reaches call [0x7ffe1000].
++ * That is the path Mihawk, explorer and Battle.net already ran.
+  *
+- * After the rewrite, SystemCall is stored as 0, which is what Windows 10
+- * leaves on a CPU that has syscall. An intact stub, and a stub whose first
+- * byte is 5c but whose cd 2e is still there, then executes int 2e. Both
+- * encodings, inside ntdll.dll, enter the existing dispatcher: eax is the
+- * 19045 id, r10 is the first argument, and [rsp+0x28] is the fifth. The
+- * dispatcher subtracts 0xb from the return address, so the frame is given
+- * rip+2+0xb and the stub's ret runs with the status in rax. */
++ * The WowB fault is the one stub whose first byte the loader stored as 0x5c
++ * (pop rsp) at ntdll+0x58340. pop rsp loads the guest return address into rsp
++ * before the flag test. SystemCall is still 1, so the thunk still calls the
++ * dispatcher, and the epilogue returns to the ret at +0x14 with that rsp.
++ * ps5_repair_patched_stub runs only for that entry: rsp is outside the thread
++ * stack, and the bytes at frame->rip-0x14 are a thunk whose first byte is no
++ * longer 4c 8b d1. It puts rsp back on the stack slot that still holds the
++ * popped qword, and it puts the guest rcx into r10 because mov r10, rcx did
++ * not run. An intact thunk never enters that function.
++ *
++ * syscall and int 2e inside ntdll are still emulated if they fault. Startup
++ * does not execute them. */
+ 
+ static int ps5_pc_in_ntdll( ULONG_PTR pc )
+ {
+@@ -3653,34 +3656,109 @@
+     return TRUE;
+ }
+ 
+-/* The shared USD view is read-only. Store 0 only after the stubs are cd 2e.
+- * The initializer in virtual_init_user_shared_data stays 1, so a stub that
+- * still contains syscall takes call [0x7ffe1000] instead of the kernel. */
+-static unsigned int ps5_clear_system_call(void)
++/* Bit 0 of KUSER_SHARED_DATA.SystemCall selects the thunk. 1 is the
++ * initializer and the call [0x7ffe1000] path. 0 executes the syscall
++ * instruction, which enters the Prospero kernel. Publish 1 if bit 0 is clear. */
++static unsigned int ps5_keep_system_call(void)
+ {
+     const size_t host = (size_t)sysconf( _SC_PAGESIZE );
+     unsigned int value;
+ 
+     if (!user_shared_data) return 0xffffffff;
+     value = user_shared_data->SystemCall;
++    if (value & 1) return value;
+     if (!host || 0x308 + sizeof(ULONG) > host) return value;
+     if (mprotect( user_shared_data, host, PROT_READ | PROT_WRITE )) return value;
+-    user_shared_data->SystemCall = 0;
++    user_shared_data->SystemCall = value | 1;
+     value = user_shared_data->SystemCall;
+     mprotect( user_shared_data, host, PROT_READ );
+     return value;
+ }
+ 
+-/* Replace the Win10 stub's syscall with int 2e. 258 sites in this ntdll .text.
+- * Other 0f 05 bytes are displacements (a call's rel32) and stay. */
+-void ps5_arm_ntdll_syscalls( void *module )
++/* Wine's x64 thunk, from include/wine/asm.h. frame->rip has already had 0xb
++ * subtracted, so it points at the ret after syscall. */
++#define PS5_STUB_RET  0x14
++#define PS5_STUB_CALL 0x18
++
++/* Called from the dispatcher with the kernel stack already in rsp, and only
++ * when frame->rsp is outside the thread stack. Returns the r10 the service
++ * call should use. An intact thunk (4c 8b d1) is left unchanged: Mihawk,
++ * explorer, Battle.net and every WowB syscall before the loader's store take
++ * that return. The repaired entry is a thunk whose first byte was rewritten. */
++ULONG64 ps5_repair_patched_stub( struct syscall_frame *frame, TEB *teb, ULONG64 guest_rcx )
++{
++    static int depth, lines;
++    ULONG64 r10;
++    ULONG_PTR rsp, rip, stub, limit, base, slot;
++    unsigned int slots = 0;
++    BYTE head[0x20];
++    char line[320];
++
++    r10 = frame ? frame->r10 : 0;
++    if (!frame || !teb) return r10;
++    if (__atomic_fetch_add( &depth, 1, __ATOMIC_RELAXED ))
++    {
++        __atomic_fetch_sub( &depth, 1, __ATOMIC_RELAXED );
++        return r10;
++    }
++
++    rsp = frame->rsp;
++    rip = frame->rip;
++    limit = (ULONG_PTR)teb->Tib.StackLimit;
++    base = (ULONG_PTR)teb->Tib.StackBase;
++    slot = 0;
++    if (rip >= PS5_STUB_RET && ps5_pc_in_ntdll( rip - PS5_STUB_RET ) &&
++        ps5_read_bytes( (void *)(rip - PS5_STUB_RET), head, sizeof(head) ) &&
++        head[PS5_STUB_RET] == 0xc3 && head[0x10] == 0x75 && head[0x11] == 0x03 &&
++        head[PS5_STUB_CALL] == 0xff && head[0x19] == 0x14 && head[0x1a] == 0x25 &&
++        head[0x1b] == 0x00 && head[0x1c] == 0x10 && head[0x1d] == 0xfe && head[0x1e] == 0x7f &&
++        !(head[0] == 0x4c && head[1] == 0x8b && head[2] == 0xd1))
++    {
++        stub = rip - PS5_STUB_RET;
++        /* 5c 8b d1 is pop rsp; mov edx, ecx. mov r10, rcx did not run, and the
++         * dispatcher has already overwritten rcx. The entry saved the guest value. */
++        if (head[0] == 0x5c && head[1] == 0x8b && head[2] == 0xd1)
++        {
++            r10 = guest_rcx;
++            frame->r10 = r10;
++        }
++        slot = ps5_find_stack_slot( limit, base, rsp, &slots );
++        if (slot) frame->rsp = slot;
++        if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) < 32)
++        {
++            snprintf( line, sizeof(line),
++                      "wine-ps5: stub-repair id=%#x stub=%p head=%02x%02x%02x rsp=%p slot=%p slots=%u "
++                      "r10=%#llx rdx=%#llx\n",
++                      frame->syscall_id, (void *)stub, head[0], head[1], head[2],
++                      (void *)rsp, (void *)slot, slots,
++                      (unsigned long long)r10, (unsigned long long)frame->rdx );
++            ps5_log_line( line );
++        }
++    }
++    else if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) < 8)
++    {
++        snprintf( line, sizeof(line),
++                  "wine-ps5: stub-repair skip rip=%p rsp=%p r10=%#llx why=not-thunk\n",
++                  (void *)rip, (void *)rsp, (unsigned long long)r10 );
++        ps5_log_line( line );
++    }
++    __atomic_fetch_sub( &depth, 1, __ATOMIC_RELAXED );
++    return r10;
++}
++
++/* Count Win10 thunks. syscall is 75 03 0f 05, the file bytes. int2e is
++ * 75 03 cd 2e left by 1254/1255; those two bytes are put back so startup
++ * cannot execute int 2e. Other 0f 05 bytes are displacements and stay. */
++static void ps5_scan_syscall_sites( void *module, unsigned int *syscall_sites,
++                                    unsigned int *int2e_sites, int restore )
+ {
+     IMAGE_DOS_HEADER *dos = module;
+     IMAGE_NT_HEADERS *nt;
+     IMAGE_SECTION_HEADER *sec;
+-    unsigned int i, n = 0;
+-    char line[96];
++    unsigned int i;
+ 
++    *syscall_sites = 0;
++    *int2e_sites = 0;
+     if (!module) return;
+     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+     nt = (IMAGE_NT_HEADERS *)((char *)module + dos->e_lfanew);
+@@ -3698,9 +3776,12 @@
+         size = sec[i].Misc.VirtualSize;
+         if (!size) continue;
+         start = (BYTE *)module + sec[i].VirtualAddress;
+-        addr = start;
+-        if (!NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_EXECUTE_READWRITE, &old ))
+-            opened = 1;
++        if (restore)
++        {
++            addr = start;
++            if (!NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_EXECUTE_READWRITE, &old ))
++                opened = 1;
++        }
+         for (off = 0; off + 4 <= sec[i].Misc.VirtualSize; )
+         {
+             BYTE buf[4096];
+@@ -3712,11 +3793,20 @@
+             if (got < 4) break;
+             for (j = 0; j + 4 <= got; j++)
+             {
+-                BYTE op[2] = { 0xcd, 0x2e };
++                BYTE op[2] = { 0x0f, 0x05 };
+ 
+-                if (buf[j] != 0x75 || buf[j + 1] != 0x03 || buf[j + 2] != 0x0f || buf[j + 3] != 0x05)
++                if (buf[j] != 0x75 || buf[j + 1] != 0x03) continue;
++                if (buf[j + 2] == 0x0f && buf[j + 3] == 0x05)
++                {
++                    (*syscall_sites)++;
++                    j += 3;
+                     continue;
+-                if (!virtual_uninterrupted_write_memory( start + off + j + 2, op, 2 )) n++;
++                }
++                if (buf[j + 2] != 0xcd || buf[j + 3] != 0x2e) continue;
++                if (restore && !virtual_uninterrupted_write_memory( start + off + j + 2, op, 2 ))
++                    (*syscall_sites)++;
++                else
++                    (*int2e_sites)++;
+                 j += 3;
+             }
+             if (got < 4) break;
+@@ -3730,8 +3820,29 @@
+             NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old, &dummy );
+         }
+     }
+-    snprintf( line, sizeof(line), "wine-ps5: syscall-arm ntdll count=%u systemcall=%#x\n",
+-              n, ps5_clear_system_call() );
++}
++
++/* Leave the thunks on call [0x7ffe1000]. The line is written before the scan
++ * so a fault in the walk is still named. path=call is every process. */
++void ps5_arm_ntdll_syscalls( void *module )
++{
++    unsigned int syscall_sites = 0, int2e_sites = 0, systemcall;
++    char line[160];
++
++    systemcall = user_shared_data ? user_shared_data->SystemCall : 0xffffffff;
++    snprintf( line, sizeof(line), "wine-ps5: syscall-boot systemcall=%#x\n", systemcall );
++    ps5_log_line( line );
++    ps5_scan_syscall_sites( module, &syscall_sites, &int2e_sites, 0 );
++    if (int2e_sites)
++    {
++        unsigned int left = 0, restored_syscall = 0;
++        ps5_scan_syscall_sites( module, &restored_syscall, &left, 1 );
++        syscall_sites = restored_syscall;
++        int2e_sites = left;
++    }
++    snprintf( line, sizeof(line),
++              "wine-ps5: syscall-arm ntdll syscall=%u int2e=%u systemcall=%#x path=call\n",
++              syscall_sites, int2e_sites, ps5_keep_system_call() );
+     ps5_log_line( line );
+ }
+ #endif
+@@ -4464,6 +4575,15 @@
+     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
+     void *ptr, *kernel_stack = (char *)thread_data->kernel_stack + kernel_stack_size;
+ 
++#ifdef __PROSPERO__
++    {
++        char line[96];
++        unsigned int systemcall = user_shared_data ? user_shared_data->SystemCall : 0xffffffff;
++
++        snprintf( line, sizeof(line), "wine-ps5: signal-init systemcall=%#x\n", systemcall );
++        ps5_log_line( line );
++    }
++#endif
+     if (user_shared_data->XState.Size) xstate_size = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
+     frame_size = offsetof( struct syscall_frame, xstate ) + xstate_size;
+ 
+@@ -4547,6 +4667,9 @@
+     if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
+ #endif
+     install_bpf(&sig_act);
++#ifdef __PROSPERO__
++    ps5_log_line( "wine-ps5: signal-init handlers=ready\n" );
++#endif
+     return;
+ 
+  error:
+@@ -4717,6 +4840,9 @@
+  *           __wine_syscall_dispatcher
+  */
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
++#ifdef __PROSPERO__
++                   "movq %rcx,%r11\n\t"            /* guest rcx; the epilogue reloads r11 from eflags */
++#endif
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") ":\n\t"
+                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+@@ -4790,9 +4916,43 @@
+                    __ASM_CFI_REG_IS_AT1(r14, rbp, 0x48)
+                    __ASM_CFI_REG_IS_AT1(r15, rbp, 0x50)
+                    __ASM_CFI_REG_IS_AT1(rbp, rbp, 0x00)
++#ifdef __PROSPERO__
++                   /* rsp inside the thread stack: the intact thunk. Fall through.
++                    * rsp outside it: pop rsp already ran. Switch to the kernel stack
++                    * before the call; the smashed rsp cannot take one. */
++                   "movq 0x08(%r13),%rax\n\t"      /* Tib.StackBase */
++                   "cmpq 0x10(%r13),%rax\n\t"      /* Tib.StackLimit */
++                   "jbe " __ASM_LOCAL_LABEL("ps5_stub_rsp_ok") "\n\t"
++                   "movq 0x88(%rcx),%rdx\n\t"      /* frame->rsp */
++                   "cmpq 0x10(%r13),%rdx\n\t"
++                   "jb " __ASM_LOCAL_LABEL("ps5_stub_rsp_bad") "\n\t"
++                   "cmpq %rax,%rdx\n\t"
++                   "jae " __ASM_LOCAL_LABEL("ps5_stub_rsp_bad") "\n\t"
++                   "testq $7,%rdx\n\t"
++                   "jz " __ASM_LOCAL_LABEL("ps5_stub_rsp_ok") "\n\t"
++                   __ASM_LOCAL_LABEL("ps5_stub_rsp_bad") ":\n\t"
++                   "movq %rcx,%rsp\n\t"
++                   "pushq %r8\n\t"
++                   "pushq %r9\n\t"
++                   "pushq %r10\n\t"
++                   "movq %rcx,%rdi\n\t"
++                   "movq %r13,%rsi\n\t"
++                   "movq %r11,%rdx\n\t"            /* guest rcx saved at entry */
++                   "call " __ASM_NAME("ps5_repair_patched_stub") "\n\t"
++                   "leaq -0x98(%rbp),%rcx\n\t"
++                   "addq $8,%rsp\n\t"
++                   "popq %r9\n\t"
++                   "popq %r8\n\t"
++                   "movq %rax,%r10\n\t"
++                   "movq 0x88(%rcx),%rdx\n\t"
++                   "leaq 0x28(%rdx),%r15\n\t"      /* 5th argument, repaired rsp */
++                   "jmp " __ASM_LOCAL_LABEL("ps5_dispatcher_on_kernel_stack") "\n\t"
++                   __ASM_LOCAL_LABEL("ps5_stub_rsp_ok") ":\n\t"
++#endif
+                    "leaq 0x28(%rsp),%r15\n\t"      /* 5th argument */
+                    /* switch to kernel stack */
+                    "movq %rcx,%rsp\n\t"
++                   __ASM_LOCAL_LABEL("ps5_dispatcher_on_kernel_stack") ":\n\t"
+                    /* we're now on the kernel stack, stitch unwind info with previous frame */
+                    __ASM_CFI_CFA_IS_AT1(rbp, 0x10) /* frame->syscall_cfa */
+                    __ASM_CFI(".cfi_offset %rip,-0x08\n\t")
+@@ -5095,6 +5255,9 @@
+                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+ 
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
++#ifdef __PROSPERO__
++                   "movq %rcx,%r11\n\t"            /* guest rcx; same as the plain entry */
++#endif
+                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")

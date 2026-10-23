@@ -93,6 +93,12 @@ declare -A sources=(
     [test_pw_gpu_staging]=""
     [test_pw_fd_census]="src/pw_fd_census.c"
     [test_pw_file_query]=""
+    [test_pw_status_note]=""
+    [test_pw_dcomp_stub]=""
+    [test_pw_umip]=""
+    [test_pw_gp]=""
+    [test_pw_wow_loader]=""
+    [test_syscall_numbers]=""
     [test_pw_pipe_memory]="src/pw_pipe_memory.c"
     [test_pw_memory_guard]="src/pw_memory_guard.c"
     [test_pw_memory_policy]="src/pw_memory_policy.c"
@@ -175,6 +181,11 @@ for test in "$root"/tests/test_*.c; do
         ran=$((ran + 1))
         continue
     fi
+    if [[ $name == test_syscall_numbers ]]; then
+        python3 "$root/tools/check-syscall-numbers.py" --self-test
+        ran=$((ran + 1))
+        continue
+    fi
     [[ -v sources[$name] ]] || { echo "$name: no entry in tools/host-tests.sh" >&2; exit 1; }
     if [[ $name == test_wine_fault_served ]]; then
         # shortcut: reads the tree the last build-wine-ps5.sh applied, not the patch series; build after editing 1127.
@@ -237,7 +248,7 @@ if (( $# == 0 )) || [[ "$*" == *console_guard* ]]; then
     for test in console_guard battery_runner shell_capture window_compose_runner appearance_runner profile_report \
             desktop_session_runner desktop_input_runner tls_fixture telemetry_teardown \
             window_material_tokens window_effects_runner frame_pacing_runner deploy_folder console_setup sched_watch run_console_verdicts \
-            placed_unmap_order module_wiring helper_opengl privacy_check dll_overrides prx_exports taskbar_logo stage_licences publication_check title_icon pack_runtime pw_https mihawk_wallpaper mihawk_music browser_lines sign_release package_install check_title_imports carrier_image_probe payload_firmware; do
+            placed_unmap_order module_wiring helper_opengl privacy_check dll_overrides prx_exports taskbar_logo stage_licences publication_check title_icon pack_runtime pw_https mihawk_wallpaper mihawk_music browser_lines sign_release package_install check_title_imports carrier_image_probe payload_firmware patch_win32u_dcomp; do
         python3 "$root/tests/test_$test.py"
         ran=$((ran + 1))
     done

@@ -903,6 +903,34 @@ int __wine_ps5_host_allows(const void *address, int access)
     return 1;
 }
 
+/* 1 when the kernel holds access (PROT_*) at address. Does not count. */
+int __wine_ps5_host_has(const void *address, int access)
+{
+    return kernel_allows((uintptr_t)address, 1, access);
+}
+
+/* Wine asked for write on a JIT page the exec conversion left R|X (1252: image code, unix 0x5).
+ * sceKernelMprotect to unix_prot, and when the kernel still lacks a bit of it, replace the JIT
+ * object and protect again. 0, or -1 with errno. bytes is one host page, the object jit_over maps. */
+int __wine_ps5_jit_reprotect(void *address, size_t bytes, int unix_prot)
+{
+    const uintptr_t at = (uintptr_t)address;
+    const char *step = "mprotect";
+    const unsigned need = (unsigned)unix_prot & 7;
+
+    if (!payload_mmap || !bytes || at % PAGE || bytes % PAGE || !need) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!payload_protect(address, bytes, unix_prot) && kernel_allows(at, bytes, (int)need)) return 0;
+    if (jit_over(at, bytes, &step)) return -1;
+    if (payload_protect(address, bytes, unix_prot) || !kernel_allows(at, bytes, (int)need)) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
 /* An execute fault Wine allows that nothing can serve (a section or file view, or a failed conversion): counted, and
  * the first ones and then one in 1024 logged. */
 void __wine_ps5_exec_refused(const void *address)
@@ -1136,11 +1164,18 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
             const int direct = pw_wine_dmap_direct(fd);
             if (direct > 0) {
                 if (pw_wine_dmap_map(fd, (uintptr_t)address, bytes, (uint64_t)offset)) return MAP_FAILED;
-                /* Adopt before a protection change: a bare reservation would otherwise be backed with a second
-                 * direct-memory run. The map is read-write; a caller that asked for less is narrowed after. */
-                for (; at < end; at += piece)
-                    if (pw_wine_dmem_split(&dmem, at, end - at, &piece) && pw_wine_dmem_adopt(&dmem, at, piece))
-                        __atomic_store_n(&backing_stale, 1, __ATOMIC_RELAXED);
+                /* Adopt the host pages the map covered, not only the 4 KiB view: a bare reservation of the tail
+                 * would otherwise be backed with a second direct-memory run. The map is read-write; a caller that
+                 * asked for less is narrowed after. */
+                {
+                    const uintptr_t host = 16384;
+                    const uintptr_t cover = (uintptr_t)address & ~(host - 1);
+                    const uintptr_t cover_end = ((uintptr_t)address + bytes + host - 1) & ~(host - 1);
+                    for (at = cover; at < cover_end; at += piece)
+                        if (pw_wine_dmem_split(&dmem, at, cover_end - at, &piece) &&
+                            pw_wine_dmem_adopt(&dmem, at, piece))
+                            __atomic_store_n(&backing_stale, 1, __ATOMIC_RELAXED);
+                }
                 if ((protection & 7) != (PROT_READ | PROT_WRITE) &&
                     __wine_ps5_mprotect(address, bytes, protection)) {
                     __wine_ps5_munmap(address, bytes);

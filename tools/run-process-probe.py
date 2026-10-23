@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Run an isolated Wine child probe, restoring the signed production PRXs afterward."""
+"""Run an isolated Wine child probe, restoring the production modules afterward.
+
+Firmware 12.00 and later maps the unsigned sibling `<name>.prx.elf` (`pw_prx_elf_ps5_load_start`
+appends `.elf` and never opens the signed SELF). A deploy replaces that file with the unsigned
+module ELF and puts the production ELF back with the signed `.prx`.
+"""
 import argparse
 from ftplib import FTP
 import hashlib
@@ -140,7 +145,9 @@ def main():
         result=ftp.sendcmd('DELE '+path)
         if not result.startswith(('226','250','200')):raise RuntimeError('Unexpected deletion result')
     if not idle():raise RuntimeError('Console busy; no deployment performed')
-    record={'case':args.case,'loader':manifest,'runtime':{n:hashlib.sha256(img).hexdigest() for n,img,*_ in uploads},
+    record={'case':args.case,'loader':manifest,
+            'runtime':{n:hashlib.sha256(img).hexdigest() for n,img,*_ in uploads},
+            'runtime_elf':{n:hashlib.sha256(elf).hexdigest() for n,_,elf,*_ in uploads},
             'passed':False,'production_restored':False,'helper_removed':False,'status':'incomplete'}
     if args.payload:record['payload']=payload_manifest
     if args.gpu_device_share:record['gpu_device_share']=True
@@ -163,6 +170,9 @@ def main():
             for name,_,_,original,original_elf in uploads:
                 if not verified(download(ftp,RUNTIME+name+'.prx'), original, original_elf):
                     raise RuntimeError('Installed production module differs from signed local backup: '+name)
+                # What a 12.00+ helper actually maps. A newer .prx beside an older .prx.elf does not load.
+                if download(ftp,RUNTIME+name+'.prx.elf') != original_elf:
+                    raise RuntimeError('Installed production module ELF differs from local backup: '+name+'.prx.elf')
             if args.case=='payload-owner-close' and download(ftp,'/data/ps5proton/prefixes/probe/drive_c/payload-owner-ready',True):raise RuntimeError('Owner-close readiness file already exists')
             # Production ships the helper loader and these probes (tools/build-production.sh): a run replaces them and
             # puts production's copies back afterwards; an older install had none, and the run removes its own.
@@ -246,6 +256,9 @@ def main():
                 ftp.storbinary('STOR '+RUNTIME+name+'.prx',io.BytesIO(image))
                 if not verified(download(ftp,RUNTIME+name+'.prx'), image, expected):
                     raise RuntimeError('Experimental module readback mismatch: '+name)
+                ftp.storbinary('STOR '+RUNTIME+name+'.prx.elf',io.BytesIO(expected))
+                if download(ftp,RUNTIME+name+'.prx.elf') != expected:
+                    raise RuntimeError('Experimental module ELF readback mismatch: '+name+'.prx.elf')
             if args.payload:
                 payload_uploaded=True;record['payload_uploaded']=True;evidence.write_text(json.dumps(record,indent=2)+'\n')
                 ftp.storbinary('STOR '+payload_path,io.BytesIO(payload_image))
@@ -542,7 +555,9 @@ def main():
                     for name,_,_,original,expected in uploads:
                         if name not in deployed:continue
                         ftp.storbinary('STOR '+RUNTIME+name+'.prx',io.BytesIO(original))
+                        ftp.storbinary('STOR '+RUNTIME+name+'.prx.elf',io.BytesIO(expected))
                         restored=restored and verified(download(ftp,RUNTIME+name+'.prx'), original, expected)
+                        restored=restored and download(ftp,RUNTIME+name+'.prx.elf')==expected
                     record['production_restored']=restored
                     def put_back(path):
                         if path not in production_files:remove(ftp,path);return True

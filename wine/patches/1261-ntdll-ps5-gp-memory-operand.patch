@@ -1,0 +1,64 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: a #GP memory operand names that address
+
+WoW Classic's loader stores 11 bytes over NtSetIoCompletion and
+falls into 08 03, or byte [rbx], al, at ntdll+0x5834b. rbx is
+non-canonical, so Prospero raises #GP(0): trap 9, error 0. Wine
+reported a read of 0xffffffffffffffff, and the vectored handler
+did not match the store it raised. A #GP(0) whose instruction has
+a memory operand now reports that address and whether it is a
+store. Privileged instructions still win. int 2e still has a
+nonzero error and still goes through handle_interrupt. Page faults
+are unchanged. wine/ps5/pw_wine_gp.h, host test tests/test_pw_gp.c.
+No console run.
+---
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -1957,6 +1957,8 @@
+ 
+ #include "pw_wine_umip.h"
+ 
++#include "pw_wine_gp.h"
++
+ /* One line, at most 16 a process, before KiUserExceptionDispatcher. bytes are the
+  * 32 bytes at RIP. emulated is sgdt/sidt/smsw/sldt/str when the instruction was
+  * completed here, and no when the exception is about to be delivered. */
+@@ -2721,7 +2723,38 @@
+             if ((err & 7) == 2 && handle_interrupt( ucontext, &rec, &context )) return;
+             rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+             rec.NumberParameters = 2;
++#ifdef __PROSPERO__
++            if (!err)
++            {
++                BYTE raw[15];
++                unsigned int n, reg;
++                unsigned long long regs[16];
++                struct pw_gp_mem op;
++                void *segbase;
++                int ok;
++
++                n = (unsigned int)virtual_uninterrupted_read_memory( (void *)RIP_sig(ucontext), raw, sizeof(raw) );
++                for (reg = 0; reg < 16; reg++) regs[reg] = *ps5_sig_reg( ucontext, reg );
++                ok = pw_gp_memory( raw, n, CS_sig(ucontext) == cs64_sel, regs,
++                                   (unsigned long long)RIP_sig(ucontext), &op );
++                if (ok && op.seg)
++                {
++                    segbase = NULL;
++                    if (op.seg == PW_GP_SEG_FS)
++                        ok = !amd64_get_fsbase( &segbase );
++                    else
++                        ok = !amd64_get_gsbase( &segbase );
++                    if (ok) op.address += (ULONG_PTR)segbase;
++                }
++                if (ok)
++                {
++                    rec.ExceptionInformation[0] = op.write ? 1 : 0;
++                    rec.ExceptionInformation[1] = op.address;
++                    break;
++                }
++            }
++#endif
+             rec.ExceptionInformation[0] = 0;
+             /* if error contains a LDT selector, use that as fault address */
+             if ((err & 7) == 4) rec.ExceptionInformation[1] = err & ~7;
+             else rec.ExceptionInformation[1] = 0xffffffffffffffff;
