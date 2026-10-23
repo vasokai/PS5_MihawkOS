@@ -1,0 +1,714 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: number x64 syscalls as Windows 10 build 19045
+
+This Wine reports 10.0.19045. On x64 that build, 0xe9 is
+NtFlushInstructionCache and NtSetIoCompletion is 0x1a3. The generated
+table was dense, so 0xe9 was NtSetIoCompletion. make_specfiles copied one
+spec number into both lists. The 32-bit list stays that dense assignment.
+The 64-bit list is the 19045 table. NtAlertMultipleThreadByThreadId, the
+one Wine-only ntdll service, is 0x1d9, still below the win32u bit.
+
+The service table, the argument counts and the name array are [id] = value.
+A Windows service this Wine does not implement is NULL. The x64 dispatcher
+tests the slot and returns STATUS_INVALID_SYSTEM_SERVICE (0xC000001C).
+trace_syscall and ps5_syscall_name index the name array and reject an id
+past its length. ps5_narrow_syscall_args stays designated by the same id.
+
+No console run.
+---
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index d70dc84..1f0c0ee 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -141,16 +141,20 @@ static void stub_syscall( const char *name )
+ #define SYSCALL_STUB(name) static void name(void) { stub_syscall( #name ); }
+ ALL_SYSCALL_STUBS
+ 
++/* [id] = function. On the 64-bit build the id is the Windows 10 build 19045 x64
++ * number, so a hole (a service this Wine does not implement) is NULL. The
++ * dispatcher returns STATUS_INVALID_SYSTEM_SERVICE for that slot. The 32-bit
++ * list is still dense, and the same initializer is that dense table. */
+ static void * const syscalls[] =
+ {
+-#define SYSCALL_ENTRY(id,name,args) name,
++#define SYSCALL_ENTRY(id,name,args) [id] = name,
+     ALL_SYSCALLS
+ #undef SYSCALL_ENTRY
+ };
+ 
+ static BYTE syscall_args[ARRAY_SIZE(syscalls)] =
+ {
+-#define SYSCALL_ENTRY(id,name,args) args,
++#define SYSCALL_ENTRY(id,name,args) [id] = args,
+     ALL_SYSCALLS
+ #undef SYSCALL_ENTRY
+ };
+@@ -180,7 +184,7 @@ enum
+ 
+ static const char *ntsyscall_names[] =
+ {
+-#define SYSCALL_ENTRY(id,name,args) #name,
++#define SYSCALL_ENTRY(id,name,args) [id] = #name,
+     ALL_SYSCALLS
+ #undef SYSCALL_ENTRY
+ };
+@@ -757,9 +761,20 @@ void trace_syscall( UINT id, ULONG_PTR *args, ULONG len )
+ {
+     UINT idx = (id >> 12) & 3, num = id & 0xfff;
+     const char **names = syscall_names[idx];
++    const char *name = NULL;
+ 
+-    if (names && names[num])
+-        TRACE_(syscall)( "\1SysCall  %s(", names[num] );
++    /* Table 0 is [id] = name and its size is max id + 1. A Windows id past
++     * that array must not be read. A hole inside it is NULL. */
++    if (idx == 0)
++    {
++        if (num < ARRAY_SIZE(ntsyscall_names))
++            name = ntsyscall_names[num];
++    }
++    else if (names)
++        name = names[num];
++
++    if (name)
++        TRACE_(syscall)( "\1SysCall  %s(", name );
+     else
+         TRACE_(syscall)( "\1SysCall  %04x(", id );
+ 
+@@ -776,9 +791,18 @@ void trace_sysret( UINT id, ULONG_PTR retval )
+ {
+     UINT idx = (id >> 12) & 3, num = id & 0xfff;
+     const char **names = syscall_names[idx];
++    const char *name = NULL;
++
++    if (idx == 0)
++    {
++        if (num < ARRAY_SIZE(ntsyscall_names))
++            name = ntsyscall_names[num];
++    }
++    else if (names)
++        name = names[num];
+ 
+-    if (names && names[num])
+-        TRACE_(syscall)( "\1SysRet   %s() retval=%08lx\n", names[num], retval );
++    if (name)
++        TRACE_(syscall)( "\1SysRet   %s() retval=%08lx\n", name, retval );
+     else
+         TRACE_(syscall)( "\1SysRet   %04x() retval=%08lx\n", id, retval );
+ }
+@@ -3066,8 +3090,8 @@ void ps5_extend_syscall_args( UINT mask, ULONG_PTR *args )
+ 
+ #include "pw_wine_status.h"
+ 
+-/* ntsyscall_names is the unix build's ALL_SYSCALLS list (the 32-bit numbers). Shared ntdll
+- * services use the same number in the 64-bit list. A win32u id (table 1) has no length here. */
++/* ntsyscall_names is [id] = name. On this 64-bit build the id is the Windows 10
++ * build 19045 x64 number. A win32u id (table 1) has no name here. */
+ static const char *ps5_syscall_name( unsigned int id )
+ {
+     unsigned int idx = (id >> 12) & 3;
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 441ca79..49e2acb 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -4140,6 +4140,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "jae " __ASM_LOCAL_LABEL("bad_syscall") "\n\t"
+                    "movq (%rbx),%rcx\n\t"          /* table->ServiceTable */
+                    "movq (%rcx,%rax,8),%r12\n\t"
++                   "testq %r12,%r12\n\t"           /* unimplemented id: the slot is NULL */
++                   "jz " __ASM_LOCAL_LABEL("bad_syscall") "\n\t"
+                    "movq 24(%rbx),%rcx\n\t"        /* table->ArgumentTable */
+                    "movzbl (%rcx,%rax),%ecx\n\t"
+                    "subq $0x30,%rcx\n\t"
+diff --git a/dlls/ntdll/win10_19045_x64.ids b/dlls/ntdll/win10_19045_x64.ids
+new file mode 100644
+index 0000000..3c14049
+--- /dev/null
++++ b/dlls/ntdll/win10_19045_x64.ids
+@@ -0,0 +1,477 @@
++# Windows 10 build 19045 (22H2) x64 ntdll syscall numbers.
++# Name and number only, from tools/syscall-numbers/win10-19045-x64.json.
++# tools/make_specfiles assigns the 64-bit list from this file.
++# The 32-bit list stays the dense spec assignment.
++NtAccessCheck 0x0000
++NtWorkerFactoryWorkerReady 0x0001
++NtAcceptConnectPort 0x0002
++NtMapUserPhysicalPagesScatter 0x0003
++NtWaitForSingleObject 0x0004
++NtCallbackReturn 0x0005
++NtReadFile 0x0006
++NtDeviceIoControlFile 0x0007
++NtWriteFile 0x0008
++NtRemoveIoCompletion 0x0009
++NtReleaseSemaphore 0x000a
++NtReplyWaitReceivePort 0x000b
++NtReplyPort 0x000c
++NtSetInformationThread 0x000d
++NtSetEvent 0x000e
++NtClose 0x000f
++NtQueryObject 0x0010
++NtQueryInformationFile 0x0011
++NtOpenKey 0x0012
++NtEnumerateValueKey 0x0013
++NtFindAtom 0x0014
++NtQueryDefaultLocale 0x0015
++NtQueryKey 0x0016
++NtQueryValueKey 0x0017
++NtAllocateVirtualMemory 0x0018
++NtQueryInformationProcess 0x0019
++NtWaitForMultipleObjects32 0x001a
++NtWriteFileGather 0x001b
++NtSetInformationProcess 0x001c
++NtCreateKey 0x001d
++NtFreeVirtualMemory 0x001e
++NtImpersonateClientOfPort 0x001f
++NtReleaseMutant 0x0020
++NtQueryInformationToken 0x0021
++NtRequestWaitReplyPort 0x0022
++NtQueryVirtualMemory 0x0023
++NtOpenThreadToken 0x0024
++NtQueryInformationThread 0x0025
++NtOpenProcess 0x0026
++NtSetInformationFile 0x0027
++NtMapViewOfSection 0x0028
++NtAccessCheckAndAuditAlarm 0x0029
++NtUnmapViewOfSection 0x002a
++NtReplyWaitReceivePortEx 0x002b
++NtTerminateProcess 0x002c
++NtSetEventBoostPriority 0x002d
++NtReadFileScatter 0x002e
++NtOpenThreadTokenEx 0x002f
++NtOpenProcessTokenEx 0x0030
++NtQueryPerformanceCounter 0x0031
++NtEnumerateKey 0x0032
++NtOpenFile 0x0033
++NtDelayExecution 0x0034
++NtQueryDirectoryFile 0x0035
++NtQuerySystemInformation 0x0036
++NtOpenSection 0x0037
++NtQueryTimer 0x0038
++NtFsControlFile 0x0039
++NtWriteVirtualMemory 0x003a
++NtCloseObjectAuditAlarm 0x003b
++NtDuplicateObject 0x003c
++NtQueryAttributesFile 0x003d
++NtClearEvent 0x003e
++NtReadVirtualMemory 0x003f
++NtOpenEvent 0x0040
++NtAdjustPrivilegesToken 0x0041
++NtDuplicateToken 0x0042
++NtContinue 0x0043
++NtQueryDefaultUILanguage 0x0044
++NtQueueApcThread 0x0045
++NtYieldExecution 0x0046
++NtAddAtom 0x0047
++NtCreateEvent 0x0048
++NtQueryVolumeInformationFile 0x0049
++NtCreateSection 0x004a
++NtFlushBuffersFile 0x004b
++NtApphelpCacheControl 0x004c
++NtCreateProcessEx 0x004d
++NtCreateThread 0x004e
++NtIsProcessInJob 0x004f
++NtProtectVirtualMemory 0x0050
++NtQuerySection 0x0051
++NtResumeThread 0x0052
++NtTerminateThread 0x0053
++NtReadRequestData 0x0054
++NtCreateFile 0x0055
++NtQueryEvent 0x0056
++NtWriteRequestData 0x0057
++NtOpenDirectoryObject 0x0058
++NtAccessCheckByTypeAndAuditAlarm 0x0059
++NtQuerySystemTime 0x005a
++NtWaitForMultipleObjects 0x005b
++NtSetInformationObject 0x005c
++NtCancelIoFile 0x005d
++NtTraceEvent 0x005e
++NtPowerInformation 0x005f
++NtSetValueKey 0x0060
++NtCancelTimer 0x0061
++NtSetTimer 0x0062
++NtAccessCheckByType 0x0063
++NtAccessCheckByTypeResultList 0x0064
++NtAccessCheckByTypeResultListAndAuditAlarm 0x0065
++NtAccessCheckByTypeResultListAndAuditAlarmByHandle 0x0066
++NtAcquireCrossVmMutant 0x0067
++NtAcquireProcessActivityReference 0x0068
++NtAddAtomEx 0x0069
++NtAddBootEntry 0x006a
++NtAddDriverEntry 0x006b
++NtAdjustGroupsToken 0x006c
++NtAdjustTokenClaimsAndDeviceGroups 0x006d
++NtAlertResumeThread 0x006e
++NtAlertThread 0x006f
++NtAlertThreadByThreadId 0x0070
++NtAllocateLocallyUniqueId 0x0071
++NtAllocateReserveObject 0x0072
++NtAllocateUserPhysicalPages 0x0073
++NtAllocateUserPhysicalPagesEx 0x0074
++NtAllocateUuids 0x0075
++NtAllocateVirtualMemoryEx 0x0076
++NtAlpcAcceptConnectPort 0x0077
++NtAlpcCancelMessage 0x0078
++NtAlpcConnectPort 0x0079
++NtAlpcConnectPortEx 0x007a
++NtAlpcCreatePort 0x007b
++NtAlpcCreatePortSection 0x007c
++NtAlpcCreateResourceReserve 0x007d
++NtAlpcCreateSectionView 0x007e
++NtAlpcCreateSecurityContext 0x007f
++NtAlpcDeletePortSection 0x0080
++NtAlpcDeleteResourceReserve 0x0081
++NtAlpcDeleteSectionView 0x0082
++NtAlpcDeleteSecurityContext 0x0083
++NtAlpcDisconnectPort 0x0084
++NtAlpcImpersonateClientContainerOfPort 0x0085
++NtAlpcImpersonateClientOfPort 0x0086
++NtAlpcOpenSenderProcess 0x0087
++NtAlpcOpenSenderThread 0x0088
++NtAlpcQueryInformation 0x0089
++NtAlpcQueryInformationMessage 0x008a
++NtAlpcRevokeSecurityContext 0x008b
++NtAlpcSendWaitReceivePort 0x008c
++NtAlpcSetInformation 0x008d
++NtAreMappedFilesTheSame 0x008e
++NtAssignProcessToJobObject 0x008f
++NtAssociateWaitCompletionPacket 0x0090
++NtCallEnclave 0x0091
++NtCancelIoFileEx 0x0092
++NtCancelSynchronousIoFile 0x0093
++NtCancelTimer2 0x0094
++NtCancelWaitCompletionPacket 0x0095
++NtCommitComplete 0x0096
++NtCommitEnlistment 0x0097
++NtCommitRegistryTransaction 0x0098
++NtCommitTransaction 0x0099
++NtCompactKeys 0x009a
++NtCompareObjects 0x009b
++NtCompareSigningLevels 0x009c
++NtCompareTokens 0x009d
++NtCompleteConnectPort 0x009e
++NtCompressKey 0x009f
++NtConnectPort 0x00a0
++NtContinueEx 0x00a1
++NtConvertBetweenAuxiliaryCounterAndPerformanceCounter 0x00a2
++NtCopyFileChunk 0x00a3
++NtCreateCrossVmEvent 0x00a4
++NtCreateCrossVmMutant 0x00a5
++NtCreateDebugObject 0x00a6
++NtCreateDirectoryObject 0x00a7
++NtCreateDirectoryObjectEx 0x00a8
++NtCreateEnclave 0x00a9
++NtCreateEnlistment 0x00aa
++NtCreateEventPair 0x00ab
++NtCreateIRTimer 0x00ac
++NtCreateIoCompletion 0x00ad
++NtCreateJobObject 0x00ae
++NtCreateJobSet 0x00af
++NtCreateKeyTransacted 0x00b0
++NtCreateKeyedEvent 0x00b1
++NtCreateLowBoxToken 0x00b2
++NtCreateMailslotFile 0x00b3
++NtCreateMutant 0x00b4
++NtCreateNamedPipeFile 0x00b5
++NtCreatePagingFile 0x00b6
++NtCreatePartition 0x00b7
++NtCreatePort 0x00b8
++NtCreatePrivateNamespace 0x00b9
++NtCreateProcess 0x00ba
++NtCreateProfile 0x00bb
++NtCreateProfileEx 0x00bc
++NtCreateRegistryTransaction 0x00bd
++NtCreateResourceManager 0x00be
++NtCreateSectionEx 0x00bf
++NtCreateSemaphore 0x00c0
++NtCreateSymbolicLinkObject 0x00c1
++NtCreateThreadEx 0x00c2
++NtCreateTimer 0x00c3
++NtCreateTimer2 0x00c4
++NtCreateToken 0x00c5
++NtCreateTokenEx 0x00c6
++NtCreateTransaction 0x00c7
++NtCreateTransactionManager 0x00c8
++NtCreateUserProcess 0x00c9
++NtCreateWaitCompletionPacket 0x00ca
++NtCreateWaitablePort 0x00cb
++NtCreateWnfStateName 0x00cc
++NtCreateWorkerFactory 0x00cd
++NtDebugActiveProcess 0x00ce
++NtDebugContinue 0x00cf
++NtDeleteAtom 0x00d0
++NtDeleteBootEntry 0x00d1
++NtDeleteDriverEntry 0x00d2
++NtDeleteFile 0x00d3
++NtDeleteKey 0x00d4
++NtDeleteObjectAuditAlarm 0x00d5
++NtDeletePrivateNamespace 0x00d6
++NtDeleteValueKey 0x00d7
++NtDeleteWnfStateData 0x00d8
++NtDeleteWnfStateName 0x00d9
++NtDirectGraphicsCall 0x00da
++NtDisableLastKnownGood 0x00db
++NtDisplayString 0x00dc
++NtDrawText 0x00dd
++NtEnableLastKnownGood 0x00de
++NtEnumerateBootEntries 0x00df
++NtEnumerateDriverEntries 0x00e0
++NtEnumerateSystemEnvironmentValuesEx 0x00e1
++NtEnumerateTransactionObject 0x00e2
++NtExtendSection 0x00e3
++NtFilterBootOption 0x00e4
++NtFilterToken 0x00e5
++NtFilterTokenEx 0x00e6
++NtFlushBuffersFileEx 0x00e7
++NtFlushInstallUILanguage 0x00e8
++NtFlushInstructionCache 0x00e9
++NtFlushKey 0x00ea
++NtFlushProcessWriteBuffers 0x00eb
++NtFlushVirtualMemory 0x00ec
++NtFlushWriteBuffer 0x00ed
++NtFreeUserPhysicalPages 0x00ee
++NtFreezeRegistry 0x00ef
++NtFreezeTransactions 0x00f0
++NtGetCachedSigningLevel 0x00f1
++NtGetCompleteWnfStateSubscription 0x00f2
++NtGetContextThread 0x00f3
++NtGetCurrentProcessorNumber 0x00f4
++NtGetCurrentProcessorNumberEx 0x00f5
++NtGetDevicePowerState 0x00f6
++NtGetMUIRegistryInfo 0x00f7
++NtGetNextProcess 0x00f8
++NtGetNextThread 0x00f9
++NtGetNlsSectionPtr 0x00fa
++NtGetNotificationResourceManager 0x00fb
++NtGetWriteWatch 0x00fc
++NtImpersonateAnonymousToken 0x00fd
++NtImpersonateThread 0x00fe
++NtInitializeEnclave 0x00ff
++NtInitializeNlsFiles 0x0100
++NtInitializeRegistry 0x0101
++NtInitiatePowerAction 0x0102
++NtIsSystemResumeAutomatic 0x0103
++NtIsUILanguageComitted 0x0104
++NtListenPort 0x0105
++NtLoadDriver 0x0106
++NtLoadEnclaveData 0x0107
++NtLoadKey 0x0108
++NtLoadKey2 0x0109
++NtLoadKeyEx 0x010a
++NtLockFile 0x010b
++NtLockProductActivationKeys 0x010c
++NtLockRegistryKey 0x010d
++NtLockVirtualMemory 0x010e
++NtMakePermanentObject 0x010f
++NtMakeTemporaryObject 0x0110
++NtManageHotPatch 0x0111
++NtManagePartition 0x0112
++NtMapCMFModule 0x0113
++NtMapUserPhysicalPages 0x0114
++NtMapViewOfSectionEx 0x0115
++NtModifyBootEntry 0x0116
++NtModifyDriverEntry 0x0117
++NtNotifyChangeDirectoryFile 0x0118
++NtNotifyChangeDirectoryFileEx 0x0119
++NtNotifyChangeKey 0x011a
++NtNotifyChangeMultipleKeys 0x011b
++NtNotifyChangeSession 0x011c
++NtOpenEnlistment 0x011d
++NtOpenEventPair 0x011e
++NtOpenIoCompletion 0x011f
++NtOpenJobObject 0x0120
++NtOpenKeyEx 0x0121
++NtOpenKeyTransacted 0x0122
++NtOpenKeyTransactedEx 0x0123
++NtOpenKeyedEvent 0x0124
++NtOpenMutant 0x0125
++NtOpenObjectAuditAlarm 0x0126
++NtOpenPartition 0x0127
++NtOpenPrivateNamespace 0x0128
++NtOpenProcessToken 0x0129
++NtOpenRegistryTransaction 0x012a
++NtOpenResourceManager 0x012b
++NtOpenSemaphore 0x012c
++NtOpenSession 0x012d
++NtOpenSymbolicLinkObject 0x012e
++NtOpenThread 0x012f
++NtOpenTimer 0x0130
++NtOpenTransaction 0x0131
++NtOpenTransactionManager 0x0132
++NtPlugPlayControl 0x0133
++NtPrePrepareComplete 0x0134
++NtPrePrepareEnlistment 0x0135
++NtPrepareComplete 0x0136
++NtPrepareEnlistment 0x0137
++NtPrivilegeCheck 0x0138
++NtPrivilegeObjectAuditAlarm 0x0139
++NtPrivilegedServiceAuditAlarm 0x013a
++NtPropagationComplete 0x013b
++NtPropagationFailed 0x013c
++NtPssCaptureVaSpaceBulk 0x013d
++NtPulseEvent 0x013e
++NtQueryAuxiliaryCounterFrequency 0x013f
++NtQueryBootEntryOrder 0x0140
++NtQueryBootOptions 0x0141
++NtQueryDebugFilterState 0x0142
++NtQueryDirectoryFileEx 0x0143
++NtQueryDirectoryObject 0x0144
++NtQueryDriverEntryOrder 0x0145
++NtQueryEaFile 0x0146
++NtQueryFullAttributesFile 0x0147
++NtQueryInformationAtom 0x0148
++NtQueryInformationByName 0x0149
++NtQueryInformationEnlistment 0x014a
++NtQueryInformationJobObject 0x014b
++NtQueryInformationPort 0x014c
++NtQueryInformationResourceManager 0x014d
++NtQueryInformationTransaction 0x014e
++NtQueryInformationTransactionManager 0x014f
++NtQueryInformationWorkerFactory 0x0150
++NtQueryInstallUILanguage 0x0151
++NtQueryIntervalProfile 0x0152
++NtQueryIoCompletion 0x0153
++NtQueryLicenseValue 0x0154
++NtQueryMultipleValueKey 0x0155
++NtQueryMutant 0x0156
++NtQueryOpenSubKeys 0x0157
++NtQueryOpenSubKeysEx 0x0158
++NtQueryPortInformationProcess 0x0159
++NtQueryQuotaInformationFile 0x015a
++NtQuerySecurityAttributesToken 0x015b
++NtQuerySecurityObject 0x015c
++NtQuerySecurityPolicy 0x015d
++NtQuerySemaphore 0x015e
++NtQuerySymbolicLinkObject 0x015f
++NtQuerySystemEnvironmentValue 0x0160
++NtQuerySystemEnvironmentValueEx 0x0161
++NtQuerySystemInformationEx 0x0162
++NtQueryTimerResolution 0x0163
++NtQueryWnfStateData 0x0164
++NtQueryWnfStateNameInformation 0x0165
++NtQueueApcThreadEx 0x0166
++NtQueueApcThreadEx2 0x0167
++NtRaiseException 0x0168
++NtRaiseHardError 0x0169
++NtReadOnlyEnlistment 0x016a
++NtRecoverEnlistment 0x016b
++NtRecoverResourceManager 0x016c
++NtRecoverTransactionManager 0x016d
++NtRegisterProtocolAddressInformation 0x016e
++NtRegisterThreadTerminatePort 0x016f
++NtReleaseKeyedEvent 0x0170
++NtReleaseWorkerFactoryWorker 0x0171
++NtRemoveIoCompletionEx 0x0172
++NtRemoveProcessDebug 0x0173
++NtRenameKey 0x0174
++NtRenameTransactionManager 0x0175
++NtReplaceKey 0x0176
++NtReplacePartitionUnit 0x0177
++NtReplyWaitReplyPort 0x0178
++NtRequestPort 0x0179
++NtResetEvent 0x017a
++NtResetWriteWatch 0x017b
++NtRestoreKey 0x017c
++NtResumeProcess 0x017d
++NtRevertContainerImpersonation 0x017e
++NtRollbackComplete 0x017f
++NtRollbackEnlistment 0x0180
++NtRollbackRegistryTransaction 0x0181
++NtRollbackTransaction 0x0182
++NtRollforwardTransactionManager 0x0183
++NtSaveKey 0x0184
++NtSaveKeyEx 0x0185
++NtSaveMergedKeys 0x0186
++NtSecureConnectPort 0x0187
++NtSerializeBoot 0x0188
++NtSetBootEntryOrder 0x0189
++NtSetBootOptions 0x018a
++NtSetCachedSigningLevel 0x018b
++NtSetCachedSigningLevel2 0x018c
++NtSetContextThread 0x018d
++NtSetDebugFilterState 0x018e
++NtSetDefaultHardErrorPort 0x018f
++NtSetDefaultLocale 0x0190
++NtSetDefaultUILanguage 0x0191
++NtSetDriverEntryOrder 0x0192
++NtSetEaFile 0x0193
++NtSetHighEventPair 0x0194
++NtSetHighWaitLowEventPair 0x0195
++NtSetIRTimer 0x0196
++NtSetInformationDebugObject 0x0197
++NtSetInformationEnlistment 0x0198
++NtSetInformationJobObject 0x0199
++NtSetInformationKey 0x019a
++NtSetInformationResourceManager 0x019b
++NtSetInformationSymbolicLink 0x019c
++NtSetInformationToken 0x019d
++NtSetInformationTransaction 0x019e
++NtSetInformationTransactionManager 0x019f
++NtSetInformationVirtualMemory 0x01a0
++NtSetInformationWorkerFactory 0x01a1
++NtSetIntervalProfile 0x01a2
++NtSetIoCompletion 0x01a3
++NtSetIoCompletionEx 0x01a4
++NtSetLdtEntries 0x01a5
++NtSetLowEventPair 0x01a6
++NtSetLowWaitHighEventPair 0x01a7
++NtSetQuotaInformationFile 0x01a8
++NtSetSecurityObject 0x01a9
++NtSetSystemEnvironmentValue 0x01aa
++NtSetSystemEnvironmentValueEx 0x01ab
++NtSetSystemInformation 0x01ac
++NtSetSystemPowerState 0x01ad
++NtSetSystemTime 0x01ae
++NtSetThreadExecutionState 0x01af
++NtSetTimer2 0x01b0
++NtSetTimerEx 0x01b1
++NtSetTimerResolution 0x01b2
++NtSetUuidSeed 0x01b3
++NtSetVolumeInformationFile 0x01b4
++NtSetWnfProcessNotificationEvent 0x01b5
++NtShutdownSystem 0x01b6
++NtShutdownWorkerFactory 0x01b7
++NtSignalAndWaitForSingleObject 0x01b8
++NtSinglePhaseReject 0x01b9
++NtStartProfile 0x01ba
++NtStopProfile 0x01bb
++NtSubscribeWnfStateChange 0x01bc
++NtSuspendProcess 0x01bd
++NtSuspendThread 0x01be
++NtSystemDebugControl 0x01bf
++NtTerminateEnclave 0x01c0
++NtTerminateJobObject 0x01c1
++NtTestAlert 0x01c2
++NtThawRegistry 0x01c3
++NtThawTransactions 0x01c4
++NtTraceControl 0x01c5
++NtTranslateFilePath 0x01c6
++NtUmsThreadYield 0x01c7
++NtUnloadDriver 0x01c8
++NtUnloadKey 0x01c9
++NtUnloadKey2 0x01ca
++NtUnloadKeyEx 0x01cb
++NtUnlockFile 0x01cc
++NtUnlockVirtualMemory 0x01cd
++NtUnmapViewOfSectionEx 0x01ce
++NtUnsubscribeWnfStateChange 0x01cf
++NtUpdateWnfStateData 0x01d0
++NtVdmControl 0x01d1
++NtWaitForAlertByThreadId 0x01d2
++NtWaitForDebugEvent 0x01d3
++NtWaitForKeyedEvent 0x01d4
++NtWaitForWorkViaWorkerFactory 0x01d5
++NtWaitHighEventPair 0x01d6
++NtLoadKey3 0x01d7
++NtWaitLowEventPair 0x01d8
+diff --git a/tools/make_specfiles b/tools/make_specfiles
+index 85f2390..5e29096 100755
+--- a/tools/make_specfiles
++++ b/tools/make_specfiles
+@@ -335,10 +335,11 @@ sub get_args_size($)
+     return ($ret32, $ret64);
+ }
+ 
+-sub get_syscalls_str($$@)
++sub get_syscalls_str($$$@)
+ {
+     my $base = shift;
+     my $custom_syscalls = shift;
++    my $sparse = shift;
+     my @syscalls = @_;
+     my $ret = "";
+     my @ids;
+@@ -350,7 +351,9 @@ sub get_syscalls_str($$@)
+         my $id = $syscall->[2];
+         $ids[$id] = $syscall->[0] if defined $id;
+     }
+-    if (scalar @ids - $base > @syscalls)
++    # A Windows table is not a dense permutation of base..base+count-1. The 64-bit
++    # ntdll list is assigned before this runs; holes stay empty in the C arrays.
++    if (!$sparse && scalar @ids - $base > @syscalls)
+     {
+         printf STDERR "Syscall id 0x%x (%s) is too high (max 0x%x)\n",
+             $#ids, $ids[$#ids], $base + scalar @syscalls - 1;
+@@ -405,22 +408,69 @@ sub read_syscalls($)
+     return (\@syscalls32, \@syscalls64, \@stubs);
+ }
+ 
+-sub update_syscalls($$$$)
++# Windows 10 build 19045 x64 numbers (dlls/ntdll/win10_19045_x64.ids). The spec's
++# -syscall= value is one number, and read_syscalls copies it into both lists.
++# The 32-bit list keeps that dense assignment. The 64-bit list is this table,
++# so a guest that issues the number Windows 10 22H2 uses enters that function.
++# A name the table does not have is Wine-only and takes the next id at or above
++# 0x1d9, still in table 0 (below the win32u bit, 0x1000).
++sub assign_win10_19045_x64($)
+ {
+-    my ($spec, $file, $base, $custom) = @_;
++    my ($syscalls) = @_;
++    my $path = "dlls/ntdll/win10_19045_x64.ids";
++    open my $fh, "<", $path or die "cannot read $path: $!\n";
++    my %windows;
++    while (<$fh>)
++    {
++        next if /^\s*(?:#|$)/;
++        my ($name, $id) = split;
++        die "$path: bad line $_" unless defined $id && $name =~ /^Nt\w+$/ && $id =~ /^0x[0-9a-fA-F]+$/;
++        my $number = hex $id;
++        die "$path: duplicate id $id\n" if grep { $_ == $number } values %windows;
++        $windows{$name} = $number;
++    }
++    close $fh;
++
++    my $next = 0x1d9;
++    my %used;
++    foreach my $syscall (@$syscalls)
++    {
++        my $name = $syscall->[0];
++        my $id;
++        if (exists $windows{$name})
++        {
++            $id = $windows{$name};
++        }
++        else
++        {
++            die "Wine-only syscall $name would leave table 0\n" if $next >= 0x1000;
++            $id = $next++;
++        }
++        die "duplicate syscall id " . sprintf("0x%x", $id) . " for $name\n" if $used{$id};
++        die "ntdll syscall $name id " . sprintf("0x%x", $id) . " collides with win32u\n" if $id >= 0x1000;
++        $used{$id} = $name;
++        $syscall->[2] = $id;
++    }
++}
++
++sub update_syscalls($$$$;$)
++{
++    my ($spec, $file, $base, $custom, $assign64) = @_;
+     my ($syscalls32, $syscalls64, $stubs) = read_syscalls( $spec );
+     my @defines;
+     my $stubs_str = join("", map { sprintf " \\\n    SYSCALL_STUB( $_ )"; } sort @{$stubs});
+ 
++    $assign64->($syscalls64) if $assign64;
++
+     push @defines, "#define ALL_SYSCALL_STUBS$stubs_str\n" if $stubs_str;
+     push @defines, map { sprintf "#define SYSCALL_ENTRY_%s(id,name,args) SYSCALL_ENTRY(id,name,args)\n", $_; } sort keys %{$custom};
+ 
+ 
+     output_file( $file,
+                  "/* Automatically generated by tools/make_specfiles */\n" .
+-                 "\n#define ALL_SYSCALLS32" . get_syscalls_str( $base, $custom, @{$syscalls32} ) .
++                 "\n#define ALL_SYSCALLS32" . get_syscalls_str( $base, $custom, 0, @{$syscalls32} ) .
+                  "\n#ifdef _WIN64" .
+-                 "\n#define ALL_SYSCALLS" . get_syscalls_str( $base, $custom, @{$syscalls64} ) .
++                 "\n#define ALL_SYSCALLS" . get_syscalls_str( $base, $custom, $assign64 ? 1 : 0, @{$syscalls64} ) .
+                  "\n#else" .
+                  "\n#define ALL_SYSCALLS ALL_SYSCALLS32" .
+                  "\n#endif\n" .
+@@ -440,5 +490,5 @@ foreach my $group (@dll_groups)
+     sync_spec_files( @{$group} );
+ }
+ 
+-update_syscalls( "ntdll", "dlls/ntdll/ntsyscalls.h", 0, { NtQueryInformationProcess => 1, NtQuerySystemTime => 1 } );
++update_syscalls( "ntdll", "dlls/ntdll/ntsyscalls.h", 0, { NtQueryInformationProcess => 1, NtQuerySystemTime => 1 }, \&assign_win10_19045_x64 );
+ update_syscalls( "win32u", "dlls/win32u/win32syscalls.h", 0x1000, {} );

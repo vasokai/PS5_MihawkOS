@@ -1,3 +1,23 @@
+## x64 syscall numbers are Windows 10 build 19045 (2026-10-23, no console run)
+
+The installed tracer (ntdll pair `24743ffb…`, commit `b4d63f4`) logged `NtSetIoCompletion` at id `0xe9`, handle `-1`, type `Process`, guest `0xdfffc5faea`. This Wine reports 10.0.19045 (`dlls/ntdll/version.c`, the `WIN10` row). On x64 Windows 10 22H2 that id is `NtFlushInstructionCache`. `NtSetIoCompletion` is `0x1a3`. `NtWriteFile` is `0x8` and `NtDeviceIoControlFile` is `0x7` on both tables, so those thunks were left. The reported build stays 19045. `tests/test_pw_status_note.c` still expects the string `NtSetIoCompletion` and id `0xe9`.
+
+Patch 1246 splits the assignment `tools/make_specfiles` used to copy from one spec number into both lists. `ALL_SYSCALLS32` is the same dense list as the pin (264 ids, `0..263`). The `_WIN64` half is `tools/syscall-numbers/win10-19045-x64.json`: 257 implemented Windows names match, `NtAlertMultipleThreadByThreadId` is `0x1d9`, and no ntdll id is `>= 0x1000`. The service table, the argument-count array and `ntsyscall_names` are `[id] = value`. A Windows service this Wine does not implement is NULL. `__wine_syscall_dispatcher` tests that pointer and returns `0xC000001C` (`STATUS_INVALID_SYSTEM_SERVICE`). `trace_syscall` and `ps5_syscall_name` index the name array only when `id < ARRAY_SIZE`. `ps5_narrow_syscall_args` still builds; its designated ids are the numbers the stubs leave in `eax`, all below `0x1000` and `0x4000`. Win32u stays table 1 at `0x1000+`. The 32-bit ntdll and wow64 were not rebuilt.
+
+The three checker commands exit 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls` on the generated `_WIN64` half prints `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. `--pe` on `ntdll.dll` and `--unix` on the unstripped `ntdll.shared.elf` print the same and then agree slot for slot. The PS5 tool's `ntdll.elf` (staged as `ntdll.prx.elf`) has no section headers, so that command cannot read its symbol table. The shared ELF is the image the tool links.
+
+An export of `NtSetIoCompletion` is now immediate `0x1a3` and dispatches to `NtSetIoCompletion`. A process handle there is still `STATUS_OBJECT_TYPE_MISMATCH`, which is what Windows returns. A scan of ntdll for immediate `0xe9` reaches `NtFlushInstructionCache`. This build was not run on a console, and it does not claim the `RtlTimeToTimeFields` fault is gone. wineserver was not rebuilt.
+
+Install the three ntdll files together. The `--no-opengl` `win32u` is not a replacement for the title's OpenGL `win32u.prx.elf`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,186,688 | `2f6d3c313f23698337051030e55cb1e9d249ef3bc62907df26bf01e5cda04e57` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,421,892 | `ddcf4c90521ea7d95e95d7b66c874b274b7dcb6b3c8e956ed57e2638b440834f` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,203,874 | `87ed5b125d941aa27b73634c975159dddf91bf4ad541f47b4ba1625ca4548e80` |
+
+Build products: `.deps/wine-ps5/build/dlls/ntdll/x86_64-windows/ntdll.dll`, `.deps/wine-ps5/prx/ntdll.elf` (stage as `ntdll.prx.elf`), `.deps/wine-ps5/prx/sce_module/ntdll.prx`. The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,840,696 bytes, `9b79f2cb0921ce307d6135b3e632b032d397a4dcfbaee2b1ab6bda0d226b3d4c`. wineserver was not rebuilt: `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/wineserver.prx.elf` is 1,033,060 bytes, `52f661a15fa37e66b4ecf41f2b0e79e95187e2069614894b4f6024aa81e5eb1f`, and `wineserver.prx` is 829,643 bytes, `650c8fc84d1a5973f97bcc3393248b5a3c2b77170976114f29ad7dc6f1a1cdd1`.
+
 ## WoW Classic reads 0xC0000024 from NtSetIoCompletion (2026-10-23, no console run)
 
 The bb38f0d7 ntdll pair was installed. Era and beta crashed again. Crash.txt for that run is era `2026-10-23 11.02.41` and beta `2026-10-23 11.02.49`. Both say `ACCESS_VIOLATION` reading `0x00000000C0000024` at `0xDFFFFA5903`. The DBG-MODULE list puts `ntdll.dll` at `0xDFFFF40000` size `0xb0000` and the fault at ntdll+`0x65903`, the first read in `RtlTimeToTimeFields`. `WowClassic_loader.dll` is `0xDFFBF50000` size `0x2640000`. `WowB_loader.dll` is `0xDFF9330000` size `0x2810000`. The faulting instruction is in `ntdll.dll`.
