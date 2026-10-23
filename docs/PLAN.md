@@ -1,3 +1,35 @@
+## int 2e resumes on every thread (2026-10-23, no console run)
+
+1257 was installed and the hashes match the table in the next section: `ntdll.prx.elf` `a094f685`, `ntdll.prx` `a56da7ff`, `ntdll.dll` `63b7dab8`. Mihawk's desktop appeared, then the process crashed. `syscall-int2e ntdll armed=258 ... path=int2e reason=syscall-collides` is present, and hundreds of `syscall-emu ... op=cd2e restored=0` resumed. The faults that ended it are `#GP` with error `0x172` (IDT vector `0x2e`) delivered as a read of `0xffffffffffffffff`:
+
+| PC | Stub | id | Name | Caller |
+| --- | --- | --- | --- | --- |
+| `ntdll+0x56a55` | `+0x56a40` | `0x20` | `NtReleaseMutant` | `kernelbase.dll+0x694bf`, thread `0034` |
+| `ntdll+0x56d75` | `+0x56d60` | `0x39` | `NtFsControlFile` | `rpcrt4.dll+0x34ce0` |
+| `ntdll+0x56eb5` | `+0x56ea0` | `0x43` | `NtContinue` | `ntdll.dll+0x58a81`, thread `0060`, `rax=0x43` |
+
+The bytes at each PC are `cd 2e`. `rsp` is inside the thread stack. `NtReleaseMutant` and `NtFsControlFile` return normally, so the miss is not the non-returning family. `ps5_emulate_windows_syscall` kept one process-wide depth. A second thread that entered while the first was still inside it returned without resuming, and the `#GP` became an access violation. There is no `syscall-emu skip` line for that return.
+
+This build keeps the Win10 bytes and `SystemCall` bit 0. The depth counter is `amd64_thread_data.ps5_syscall_emu` at TEB `0x354`, one per thread. Another thread's `int 2e` still resumes at `__wine_syscall_dispatcher_prolog_end`. The two opcode bytes, and the three prefix bytes, are read from the page the CPU fetched, without `virtual_mutex`. The 64-bit image range is cached when ntdll is armed, so that check does not take the lock either. A stub inside that image is resumed even when the saved CS equals the 32-bit selector. A 32-bit CS whose PC is outside that image is left alone. `handle_interrupt` vector `0x2e` uses the same resume, so a `#GP` that names vector `0x2e` is not turned into an access violation while the resume can run.
+
+`NtContinue` (`0x43`), `NtCallbackReturn` (`0x5`), `NtRaiseException` (`0x168`) and `NtTestAlert` (`0x1c2`) stay on the Win10 bytes. They use the thread's current syscall frame, which is the frame the `call [0x7ffe1000]` path overwrites. No stub is left on the call path after `path=int2e`. A same-thread nest deeper than 4 logs `why=reenter` and does not resume. A missing frame, an outside `rsp` with no slot, or an `int 2e` outside ntdll logs `wine-ps5: syscall-emu skip ... why=frame`, `why=stack` or `why=range`, at most 16 lines. The success line gains `cs=%#x` and stays capped at 32. The stack walk still takes `virtual_mutex`, and a nested entry on the same thread skips that walk.
+
+Which path runs: `path=call` is every process from `load_ntdll` until that process logs `handlers=ready` and then `path=int2e`. After `path=int2e`, every 64-bit ntdll thunk on every thread of that process executes `int 2e`. That is Mihawk, explorer, service processes, wineserver clients, Battle.net and WowB, including `NtReleaseMutant`, `NtFsControlFile` and `NtContinue`. A 32-bit code segment outside the 64-bit image stays on its own dispatcher. Calls made before `handlers=ready` stay on `call [0x7ffe1000]`.
+
+Syscall numbers stay the 19045 table. The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The compare of protocol `0x3a3` is still the one instruction `81 fe a3 03 00 00` at VA `0x35f70`. `movl $0x3a3, %edx` is still the one instruction `ba a3 03 00 00` at VA `0x36284`. `.text` holds the dword `a3 03 00 00` three times: those two immediates, and the displacement of a `je` at VA `0x91a33` (`0f 84 a3 03 00 00`). That `je` was at `0x916f3` in the 1257 image. There is no compare of `0x3a2`. The whole file holds the dword 42 times, in the same sections as 1257: `.text` 3, `.debug_loc` 18, `.debug_info` 13, `.debug_ranges` 4, `.debug_aranges` 1, `.debug_line` 1, `.dynsym` 1, `.symtab` 1. The PE image was not rebuilt: `SizeOfImage` stays `0x2d5000`, the file stays 3,211,264 bytes, hash `63b7dab8`. wineserver was not rebuilt. The 32-bit ntdll and wow64 were not rebuilt.
+
+This build was not run on a console. Mihawk's startup is not claimed back, and the return to Play is not claimed gone. The next pull's `syscall-int2e` with `armed=258` and `path=int2e` is the rewrite. A `syscall-emu` line is a resumed `int 2e` on that thread. A `syscall-emu skip` line names a resume that did not happen. An access fault whose bytes are `cd 2e` and whose error is `0x172`, with no skip line, is the 1257 failure.
+
+Install the new unix files with the `63b7dab8` `ntdll.dll`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `63b7dab8c8e872cb375a0d051c5b8eb97ec744e88f31a0ea229c1f6e7f1bd3e4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,438,628 | `bda8c378acf9863aad7a4d9aa402ab0daf84d2cfb09b9b9f3f89c684f1250ac4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,230,290 | `507a86037b99cbf286bca357bda43ab597129599dd5b7625ef71d9d4c2068821` |
+
+The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,925,032 bytes, `e31df87925936615dac30fddf79998ad5a514a305f48ee533cad69b0ccd41b55`.
+
 ## Windows thunk bytes, trapped as int 2e (2026-10-23, no console run)
 
 1256 was built and has not been run on a console. Its hashes are the table in the next section: `ntdll.prx.elf` `860847d4`, `ntdll.prx` `869acc75`, `ntdll.dll` `63b7dab8`. That build left every thunk on `call [0x7ffe1000]`. The loader's store of byte `0x5c` at `ntdll+0x58340` is a write into a thunk whose live bytes are not Windows. Win10 19045's x64 thunk is 32 bytes: `4c 8b d1`, `mov eax, id`, `test byte [0x7ffe0308], 1`, `75 03`, `0f 05`, `c3`, `cd 2e`, `c3`, and the nop `0f 1f 84 00 00 00 00 00`.
