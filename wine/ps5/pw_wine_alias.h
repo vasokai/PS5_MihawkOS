@@ -69,6 +69,9 @@ int pw_wine_alias_init(const PwWineAliasOps *ops);
  * made (with its window) when no window holds it; 0 when there is none (not initialized, misaligned, or counted).
  * Valid until the generation changes. Under Wine's virtual mutex. */
 uintptr_t pw_wine_alias_get(uintptr_t host_page);
+/* The alias of host_page when a window already maps that direct memory, or 0. Does not create a window, does not
+ * change which window is oldest, and does not count a miss. Same lock order as get (backing, then this module). */
+uintptr_t pw_wine_alias_find(uintptr_t host_page);
 /* Direct memory [dmem, +bytes) is about to be released: every window over any of it is given back before this
  * returns. */
 void pw_wine_alias_forget(int64_t dmem, uint64_t bytes);

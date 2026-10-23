@@ -122,6 +122,23 @@ uintptr_t pw_wine_alias_get(uintptr_t host_page)
     return alias;
 }
 
+uintptr_t pw_wine_alias_find(uintptr_t host_page)
+{
+    const uintptr_t page = PW_WINE_ALIAS_HOST_PAGE, mask = page - 1;
+    uintptr_t low = 0, high = 0, alias = 0;
+    int64_t dmem = -1;
+
+    if (!__atomic_load_n(&alias_ready, __ATOMIC_ACQUIRE) || (host_page & mask) || !alias_ops.backing) return 0;
+    if (!alias_ops.backing(alias_ops.context, host_page, &dmem, &low, &high) || dmem < 0) return 0;
+    lock();
+    for (unsigned i = 0; i < window_limit && !alias; i++)
+        if (windows[i].address && windows[i].dmem <= dmem &&
+            dmem + (int64_t)page <= windows[i].dmem + (int64_t)windows[i].bytes)
+            alias = windows[i].address + (uintptr_t)(dmem - windows[i].dmem);
+    unlock();
+    return alias;
+}
+
 void pw_wine_alias_forget(int64_t dmem, uint64_t bytes)
 {
     if (!__atomic_load_n(&alias_ready, __ATOMIC_ACQUIRE) || !bytes) return;

@@ -1,0 +1,200 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: take int 2e from ntdll stubs
+
+1254 was installed (e21e5c4d/a706e789, dll 63b7dab8). syscall-arm
+counted 258 in every child and syscall-emu never fired. The fault is
+still trap 9 at ntdll+0x58354, the ret, with rsp equal to the guest
+return address. SystemCall was 1, so the stub took call [0x7ffe1000]
+and the rewritten int 2e did not run. The two NtSetIoCompletion calls
+with handle -1 returned STATUS_OBJECT_TYPE_MISMATCH for a Process,
+which is what Windows returns, and the guest continued to the store.
+
+After the cd 2e rewrite, KUSER_SHARED_DATA.SystemCall is stored as 0.
+That is the Windows 10 value, so the stub executes int 2e and the
+1254 handler dispatches it. An access fault in ntdll also logs 32
+bytes at pc-0x14 from the executing address and from an alias window
+that already exists. NtSetIoCompletion's status is unchanged.
+
+Syscall numbers are unchanged. The compare of protocol 0x3a3 is the
+same instruction. No console run.
+---
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 188e209..b011453 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2282,8 +2282,10 @@ static void load_ntdll(void)
+     load_ntdll_functions( module );
+ #if defined(__PROSPERO__) && defined(__x86_64__)
+     /* Prospero executes the PE stub's syscall instruction. cd 2e is the same
+-     * length, so the jne +3 still lands on the Wine dispatcher path, and it
+-     * faults instead of entering the kernel. */
++     * length, so it faults instead of entering the kernel. The rewrite runs
++     * first; ps5_arm_ntdll_syscalls then stores 0 at KUSER_SHARED_DATA+0x308
++     * so the stub takes int 2e. Guest code starts after the signal handlers
++     * are installed, which is after this returns. */
+     ps5_arm_ntdll_syscalls( module );
+ #endif
+     if (is_arm64ec()) redirect_ntdll_functions( module );
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 1d9c8e9..a489b6c 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -95,6 +95,7 @@ extern void _thread_set_tsd_base(uint64_t);
+ #include "wine/debug.h"
+ #ifdef __PROSPERO__
+ #include "pw_wine_mmu4k.h"
++#include "pw_wine_alias.h"
+ #endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(unwind);
+@@ -2077,6 +2078,60 @@ static BOOL ps5_try_umip( ucontext_t *ctx, siginfo_t *info, int signal )
+ /* View base, allocation flags and page byte. Fills out. Does not change the mapping. */
+ extern void ps5_describe_address( const void *addr, char *out, size_t n );
+ 
++/* 32 bytes as hex, or "-" when none of them can be read. */
++static void ps5_format_bytes( char *out, size_t n, const void *addr, SIZE_T size )
++{
++    BYTE buf[32];
++    SIZE_T got, i;
++    size_t pos = 0;
++
++    if (!out || !n) return;
++    out[0] = 0;
++    if (size > sizeof(buf)) size = sizeof(buf);
++    if (!addr || !size)
++    {
++        snprintf( out, n, "-" );
++        return;
++    }
++    got = virtual_uninterrupted_read_memory( (void *)addr, buf, size );
++    if (!got)
++    {
++        snprintf( out, n, "-" );
++        return;
++    }
++    for (i = 0; i < got; i++)
++    {
++        int wrote = snprintf( out + pos, n - pos, "%02x", buf[i] );
++
++        if (wrote < 0 || (size_t)wrote >= n - pos) break;
++        pos += wrote;
++    }
++}
++
++/* 32 bytes at pc-0x14, the NtSetIoCompletion stub when the fault is the ret at
++ * +0x14. exec is the mapping the CPU fetches. rw is an alias window that already
++ * maps that host page's direct memory; JIT and file pages have none, and this
++ * does not create one. systemcall is the byte the stub tests at 0x7ffe0308. */
++static void ps5_log_stub_bytes( ULONG_PTR pc )
++{
++    char exec[80], rw[80], line[320];
++    ULONG_PTR stub = pc >= 0x14 ? pc - 0x14 : pc;
++    uintptr_t host = (uintptr_t)stub & ~(uintptr_t)(PW_WINE_ALIAS_HOST_PAGE - 1);
++    uintptr_t alias = host ? pw_wine_alias_find( host ) : 0;
++    unsigned int systemcall = user_shared_data ? user_shared_data->SystemCall : 0xffffffff;
++
++    ps5_format_bytes( exec, sizeof(exec), (void *)stub, 32 );
++    if (alias)
++        ps5_format_bytes( rw, sizeof(rw),
++                          (void *)(alias + ((uintptr_t)stub & (PW_WINE_ALIAS_HOST_PAGE - 1))), 32 );
++    else
++        snprintf( rw, sizeof(rw), "-" );
++    snprintf( line, sizeof(line),
++              "wine-ps5: stub-bytes pc=%p stub=%p systemcall=%#x exec=%s rw=%s alias=%p\n",
++              (void *)pc, (void *)stub, systemcall, exec, rw, (void *)alias );
++    ps5_log_line( line );
++}
++
+ /* One line, at most 32 a process, for an access violation about to be delivered.
+  * pc is the signal frame's RIP. exc is the exception record, which Crash.txt prints.
+  * bytes are 16 bytes at pc. Nothing here changes the record or the frame. */
+@@ -2156,6 +2211,7 @@ static void ps5_log_access( ucontext_t *ctx, EXCEPTION_RECORD *rec, struct xcont
+               (void *)RSP_sig(ctx), (void *)xcontext->c.Rsp,
+               (unsigned long long)RCX_sig(ctx), (unsigned long long)RDX_sig(ctx) );
+     ps5_log_line( line );
++    if (!strncmp( pcmod, "ntdll.dll+", 10 )) ps5_log_stub_bytes( pc );
+ }
+ #endif
+ 
+@@ -3446,23 +3502,21 @@ static BOOL ps5_mmu4k_signal( int signal, siginfo_t *siginfo, ucontext_t *uconte
+ 
+ 
+ #ifdef __PROSPERO__
+-/* 1253 was installed (dfbe8186/db0a6ff0, dll 63b7dab8). The loader's store at
+- * ntdll+0x58340 completed (image-writecopy). The next fault is trap 9 err 0 at
+- * ntdll+0x58354, the ret after the stub's syscall (0f 05 at +0x12). The 16
+- * bytes match the file. rcx equals that rip: the CPU ran syscall and the
+- * kernel returned to the next instruction. RSP is the guest return address
+- * from the two NtSetIoCompletion calls that had just succeeded (dfffa2faea),
+- * which is what pop rsp does if the stored byte 0x5c replaced 4c. SEH cannot
+- * dispatch that frame, the thread is killed, and the payload exits.
++/* 1254 was installed (e21e5c4d/a706e789, dll 63b7dab8). syscall-arm counted
++ * 258 and syscall-emu never fired. The fault is still trap 9 err 0 at
++ * ntdll+0x58354, the ret, with rsp equal to the guest return address. The
++ * stub took call [0x7ffe1000] because SystemCall was 1, so the int 2e at
++ * +0x12 did not run. The 15.45 store of 0x5c at +0 is pop rsp; that replaces
++ * rsp before the flag test. With the bit set, the call path returns to this
++ * ret and the smashed rsp is already the frame.
+  *
+- * KUSER_SHARED_DATA.SystemCall stays 1, so a stub that sees the bit takes
+- * call [0x7ffe1000]. A stub that sees 0, as this one did, used to execute
+- * syscall. ps5_arm_ntdll_syscalls rewrites that 0f 05 to cd 2e (same length,
+- * the jne +3 still skips it). Both encodings, inside ntdll.dll, enter the
+- * existing dispatcher: eax is the 19045 id, r10 is the first argument, and
+- * [rsp+0x28] is the fifth. The dispatcher subtracts 0xb from the return
+- * address, so the frame is given rip+2+0xb and the stub's ret runs with the
+- * status in rax. */
++ * After the rewrite, SystemCall is stored as 0, which is what Windows 10
++ * leaves on a CPU that has syscall. An intact stub, and a stub whose first
++ * byte is 5c but whose cd 2e is still there, then executes int 2e. Both
++ * encodings, inside ntdll.dll, enter the existing dispatcher: eax is the
++ * 19045 id, r10 is the first argument, and [rsp+0x28] is the fifth. The
++ * dispatcher subtracts 0xb from the return address, so the frame is given
++ * rip+2+0xb and the stub's ret runs with the status in rax. */
+ 
+ static int ps5_pc_in_ntdll( ULONG_PTR pc )
+ {
+@@ -3599,6 +3653,24 @@ static BOOL ps5_emulate_windows_syscall( ucontext_t *ctx )
+     return TRUE;
+ }
+ 
++/* The shared USD view is read-only. Store 0 only after the stubs are cd 2e.
++ * The initializer in virtual_init_user_shared_data stays 1, so a stub that
++ * still contains syscall takes call [0x7ffe1000] instead of the kernel. */
++static unsigned int ps5_clear_system_call(void)
++{
++    const size_t host = (size_t)sysconf( _SC_PAGESIZE );
++    unsigned int value;
++
++    if (!user_shared_data) return 0xffffffff;
++    value = user_shared_data->SystemCall;
++    if (!host || 0x308 + sizeof(ULONG) > host) return value;
++    if (mprotect( user_shared_data, host, PROT_READ | PROT_WRITE )) return value;
++    user_shared_data->SystemCall = 0;
++    value = user_shared_data->SystemCall;
++    mprotect( user_shared_data, host, PROT_READ );
++    return value;
++}
++
+ /* Replace the Win10 stub's syscall with int 2e. 258 sites in this ntdll .text.
+  * Other 0f 05 bytes are displacements (a call's rel32) and stay. */
+ void ps5_arm_ntdll_syscalls( void *module )
+@@ -3607,7 +3679,7 @@ void ps5_arm_ntdll_syscalls( void *module )
+     IMAGE_NT_HEADERS *nt;
+     IMAGE_SECTION_HEADER *sec;
+     unsigned int i, n = 0;
+-    char line[80];
++    char line[96];
+ 
+     if (!module) return;
+     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+@@ -3658,7 +3730,8 @@ void ps5_arm_ntdll_syscalls( void *module )
+             NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old, &dummy );
+         }
+     }
+-    snprintf( line, sizeof(line), "wine-ps5: syscall-arm ntdll count=%u\n", n );
++    snprintf( line, sizeof(line), "wine-ps5: syscall-arm ntdll count=%u systemcall=%#x\n",
++              n, ps5_clear_system_call() );
+     ps5_log_line( line );
+ }
+ #endif

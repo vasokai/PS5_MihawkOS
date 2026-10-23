@@ -159,7 +159,7 @@ static void before_init(void)
     PwWineAliasOps missing = ops;
     pw_wine_alias_reset();
     call_count = 0;
-    assert(!pw_wine_alias_get(program) && !call_count);
+    assert(!pw_wine_alias_get(program) && !pw_wine_alias_find(program) && !call_count);
     pw_wine_alias_forget(0, 64 * MIB);
     assert(!call_count && !pw_wine_alias_generation());
     missing.map = NULL;
@@ -312,6 +312,23 @@ static void refusals(void)
     stats_are(1, 1, 0, 1, 2);
 }
 
+/* find answers a window that exists and does not make one, move the eviction order, or count a miss. */
+static void find_existing(void)
+{
+    setup();
+    view(program, 2 * MIB, 0);
+    assert(!pw_wine_alias_find(program) && count_of('b') == 1 && !count_of('t') && !count_of('m'));
+    stats_are(0, 0, 0, 0, 0);
+    const uintptr_t alias = pw_wine_alias_get(program);
+    const unsigned maps = count_of('m');
+    call_count = 0;
+    assert(pw_wine_alias_find(program) == alias && pw_wine_alias_find(program + PAGE) == alias + PAGE);
+    assert(count_of('b') == 2 && !count_of('t') && !count_of('m'));
+    assert(!pw_wine_alias_find(program + 4096) && !pw_wine_alias_find(program + 4 * MIB));
+    stats_are(1, 0, 0, 0, 0);
+    assert(maps == 1 && pw_wine_alias_get(program) == alias);
+}
+
 /* No backing, or an answer that does not hold the page: 0, counted, and no window asked for. A misaligned page: 0. */
 static void no_backing(void)
 {
@@ -340,9 +357,10 @@ int main(void)
     no_eviction();
     forget();
     refusals();
+    find_existing();
     no_backing();
     puts("aliases: nothing before init, windows clipped to the 2 MiB block and the backed run, reused by direct-memory "
          "offset across views, the least recently used evicted (or, with eviction off, 0), forgotten before release (only those over it), a "
-         "refused map given back, a full range evicted once then 0, no backing 0, every store coherent, passed");
+         "refused map given back, a full range evicted once then 0, no backing 0, find answers an existing window and creates none, every store coherent, passed");
     return 0;
 }
