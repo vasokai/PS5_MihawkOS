@@ -8,6 +8,7 @@
 #include "pw_wine_threads.h"
 #include "pw_wine_perf.h"
 #include "../../src/pw_ntsync.h"
+#include "../../src/pw_fmem_budget.h"
 #include <errno.h>
 #include <netdb.h>
 #include <fcntl.h>
@@ -32,7 +33,7 @@ extern int sceKernelUsleep(unsigned);
 /* service is 1 while the slot holds a helper (-1 while one starts): every helper is a payload process. */
 /* unloading: the root the title's desktop session ends on purpose (game mode, src/pw_desktop_session.h); its exit is
  * not the session's result. */
-struct child { int fd, service, pid, closing, initial, unloading, gpu_cookie, memory; void *input_page, *audio_ring; };
+struct child { int fd, service, pid, closing, initial, unloading, gpu_cookie, memory, renderer; void *input_page, *audio_ring; };
 static struct child children[32];
 static pthread_mutex_t child_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t child_closed = PTHREAD_COND_INITIALIZER;
@@ -296,7 +297,7 @@ static void *monitor_child(void *opaque)
     pthread_mutex_lock(&child_lock);
     if(child->memory>=0) { close(child->memory);child->memory=-1; }
     child->gpu_cookie=0;child->input_page=NULL;child->audio_ring=NULL;
-    child->service = 0; child->pid = 0; child->closing = 0; child->initial = 0; child->unloading = 0;
+    child->service = 0; child->pid = 0; child->closing = 0; child->initial = 0; child->unloading = 0; child->renderer = 0;
     pthread_mutex_unlock(&child_lock);
     payload_trace("resources-released",pid,control,0);
     descriptor_metrics("closed");
@@ -647,12 +648,32 @@ int pw_ps5_shared_touch(int fd, size_t from, size_t to)
     pthread_mutex_unlock(&memory_lock);
     return status;
 }
+static int chromium_renderers_live(void)
+{
+    int count = 0;
+    for (unsigned i = 0; i < 32; ++i)
+        if (children[i].renderer && children[i].service) count++;
+    return count;
+}
 static int spawn_native(int server_fd, const struct pw_child_bootstrap *boot, int *native_pid)
 {
+    int renderer_limit = 2, live = 0;
+    const char *budget = getenv("WINE_PS5_CHROMIUM_BUDGET");
+    const int enforce = !(budget && !strcmp(budget, "0")) && pw_fmem_budget_limit(getenv("WINE_PS5_RENDERER_LIMIT"), &renderer_limit);
+    const int renderer = pw_fmem_budget_is_renderer(boot->image, boot->command_line);
     pthread_mutex_lock(&child_lock);
     struct child *child = NULL;
     const int refused = spawns_ended;
-    for (unsigned i = 0; i < 32 && !refused; ++i) if (!children[i].service) { child = &children[i]; child->service = -1; break; }
+    if (renderer && enforce && !refused) live = chromium_renderers_live();
+    if (renderer && enforce && !refused && live >= renderer_limit) {
+        pthread_mutex_unlock(&child_lock);
+        fprintf(stderr, "wine-ps5: chromium renderer refused live=%d limit=%d\n", live, renderer_limit);
+        errno = EAGAIN;
+        return -1;
+    }
+    for (unsigned i = 0; i < 32 && !refused; ++i) if (!children[i].service) {
+        child = &children[i]; child->service = -1; child->renderer = renderer; break;
+    }
     pthread_mutex_unlock(&child_lock);
     if (refused) { errno = ESHUTDOWN; return -1; }
     if (!child) { errno = EAGAIN; return -1; }
@@ -743,7 +764,7 @@ static int spawn_native(int server_fd, const struct pw_child_bootstrap *boot, in
         if(pair[1]>=0) { close(pair[1]);pair[1]=-1; }
         if(payload_pid>0) { close_until_gone(payload_pid,pair[0]);pair[0]=-1; }
         if(gpu_cookie && gpu_close)gpu_close(gpu_cookie,-payload_pid);
-        pthread_mutex_lock(&child_lock); child->service = 0; child->pid = 0;
+        pthread_mutex_lock(&child_lock); child->service = 0; child->pid = 0; child->renderer = 0;
         pthread_mutex_unlock(&child_lock);
     }
     for (unsigned i = 0; i < 2; ++i) if (pair[i] != -1) close(pair[i]);

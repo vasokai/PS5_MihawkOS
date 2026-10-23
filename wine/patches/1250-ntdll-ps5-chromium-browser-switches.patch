@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 00:00:00 -0400
+Subject: [PATCH] ntdll: PS5: a Chromium browser process gets the helper budget.
+
+A Chromium host starts one GPU process and one renderer per site unless it
+is asked not to. Each helper copies the code it runs into its own JIT
+memory, and the kernel charges that copy in full. The switches MihawkBrowser
+already uses (in-process GPU, one renderer, the network service in process,
+no spare renderer and no out-of-process audio) are written into the browser
+process's command line before create_startup_info copies it. An existing
+--disable-features, --enable-features or --renderer-process-limit is left
+as it is: Chromium keeps only the last copy. A child (--type=) is unchanged.
+
+The parent's parameter block is put back after the copy. A block that is not
+normalized, or WINE_PS5_CHROMIUM_BUDGET=0, or WINE_PS5_RENDERER_LIMIT=0, is
+left alone. The spawn cap in the title's ntdll still refuses a renderer past
+the limit. No console run.
+---
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -676,6 +676,63 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
+ 
+     return STATUS_SUCCESS;
+ }
++#ifdef __PROSPERO__
++/* The browser process is given the switches that keep extra helpers from starting (src/pw_fmem_budget.h).
++ * create_startup_info copies CommandLine into the startup blob, so the parent's block is restored after.
++ * A block that is not normalized keeps offsets in its strings: replacing one would make the copy read the
++ * wrong bytes, so that block is left alone. WINE_PS5_CHROMIUM_BUDGET=0 and WINE_PS5_RENDERER_LIMIT=0 too. */
++static void ps5_chromium_budget( RTL_USER_PROCESS_PARAMETERS *params, UNICODE_STRING *saved, WCHAR **owned )
++{
++    extern int pw_fmem_budget_rewrite( const char *image, const char *command, int renderer_limit,
++                                       char *out, size_t cap );
++    extern int pw_fmem_budget_limit( const char *text, int *limit );
++    char image[1024], command[16384], rewritten[16384];
++    const char *budget;
++    int bytes, chars, limit = 2;
++    size_t wide_chars;
++    WCHAR *wide;
++
++    *owned = NULL;
++    if (!params || !params->CommandLine.Buffer || !params->CommandLine.Length) return;
++    if (!(params->Flags & PROCESS_PARAMS_FLAG_NORMALIZED)) return;
++    budget = getenv( "WINE_PS5_CHROMIUM_BUDGET" );
++    if (budget && !strcmp( budget, "0" )) return;
++    if (!pw_fmem_budget_limit( getenv( "WINE_PS5_RENDERER_LIMIT" ), &limit )) return;
++    image[0] = command[0] = 0;
++    if (params->ImagePathName.Buffer && params->ImagePathName.Length / sizeof(WCHAR) * 3 < sizeof(image))
++    {
++        bytes = ntdll_wcstoumbs( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
++                                 image, sizeof(image) - 1, FALSE );
++        if (bytes > 0 && bytes < (int)sizeof(image)) image[bytes] = 0;
++        else image[0] = 0;
++    }
++    if (params->CommandLine.Length / sizeof(WCHAR) * 3 >= sizeof(command)) return;
++    bytes = ntdll_wcstoumbs( params->CommandLine.Buffer, params->CommandLine.Length / sizeof(WCHAR),
++                             command, sizeof(command) - 1, FALSE );
++    if (bytes <= 0 || bytes >= (int)sizeof(command)) return;
++    command[bytes] = 0;
++    if (pw_fmem_budget_rewrite( image, command, limit, rewritten, sizeof(rewritten) ) != 1) return;
++    wide_chars = strlen( rewritten );
++    if (!(wide = malloc( (wide_chars + 1) * sizeof(WCHAR) ))) return;
++    chars = ntdll_umbstowcs( rewritten, wide_chars, wide, wide_chars );
++    if (chars <= 0 || (size_t)chars > wide_chars) { free( wide ); return; }
++    wide[chars] = 0;
++    *saved = params->CommandLine;
++    *owned = wide;
++    params->CommandLine.Buffer = wide;
++    params->CommandLine.Length = chars * sizeof(WCHAR);
++    params->CommandLine.MaximumLength = (chars + 1) * sizeof(WCHAR);
++}
++
++static void ps5_chromium_budget_restore( RTL_USER_PROCESS_PARAMETERS *params, const UNICODE_STRING *saved,
++                                         WCHAR **owned )
++{
++    if (!owned || !*owned) return;
++    params->CommandLine = *saved;
++    free( *owned );
++    *owned = NULL;
++}
++#endif
+ 
+ /**********************************************************************
+  *           NtCreateUserProcess  (NTDLL.@)
+@@ -777,8 +834,20 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
+         if (is_arm64ec() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
+             machine = main_image_info.Machine;
+     }
++#ifdef __PROSPERO__
++    {
++        UNICODE_STRING ps5_saved_cmdline = {0};
++        WCHAR *ps5_cmdline = NULL;
++
++        ps5_chromium_budget( params, &ps5_saved_cmdline, &ps5_cmdline );
++        startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size );
++        ps5_chromium_budget_restore( params, &ps5_saved_cmdline, &ps5_cmdline );
++    }
++    if (!startup_info) goto done;
++#else
+     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
+         goto done;
++#endif
+     env_size = get_env_size( params, &winedebug );
+ 
+     if ((status = alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;

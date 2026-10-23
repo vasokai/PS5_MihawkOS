@@ -31,6 +31,8 @@ sources=(
     "$root/src/pw_memory_file.c"
     "$root/src/pw_memory_service.c"
     "$root/src/pw_vm_census.c"
+    "$root/src/pw_fmem_census.c"
+    "$root/src/pw_prx_data.c"
     "$root/src/pw_helper_sched.c"
     "$root/src/pw_cpu_placement.c"
     "$root/src/pw_prx_elf.c"
@@ -67,7 +69,7 @@ python3 - "$root" "$sdk" "$output" <<'PYMANIFEST'
 import hashlib,json,sys
 from pathlib import Path
 root,sdk,out=map(Path,sys.argv[1:]);digest=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
-inputs=['native/proton_payload_child.c','native/proton_wine_child.c','src/pw_wine_start.c','src/pw_control_watch.h','src/pw_environment.c','src/pw_environment.h','wine/ps5/pw_wine_prx.c','wine/ps5/pw_wine_process_io.c','src/pw_memory_helper.c','src/pw_memory_helper.h','src/pw_vm_census.c','src/pw_vm_census.h','native/pw_physical_shared.h','native/pw_dmem_share.h','src/pw_shared_page.h','src/pw_memory_file.c','src/pw_memory_file.h','src/pw_memory_service.c','src/pw_memory_service.h','wine/ps5/pw_wine_process.h','wine/ps5/pw_payload_rendezvous.h','wine/ps5/pw_wine_process_io.h','src/pw_gpu_broker.h','src/pw_helper_sched.c','src/pw_helper_sched.h','src/pw_cpu_placement.c','src/pw_cpu_placement.h','src/pw_prx_elf.c','src/pw_prx_elf.h','native/pw_prx_elf_ps5.c','native/pw_prx_elf_ps5.h','src/pw_firmware.c','src/pw_firmware.h','native/pw_firmware_ps5.c','src/pw_log_sessions.h','wine/ps5/pw_wine_threads.h','wine/ps5/pw_wine_perf.h','tools/build-payload-loader.sh']
+inputs=['native/proton_payload_child.c','native/proton_wine_child.c','src/pw_wine_start.c','src/pw_control_watch.h','src/pw_environment.c','src/pw_environment.h','wine/ps5/pw_wine_prx.c','wine/ps5/pw_wine_process_io.c','src/pw_memory_helper.c','src/pw_memory_helper.h','src/pw_vm_census.c','src/pw_vm_census.h','src/pw_fmem_census.c','src/pw_fmem_census.h','src/pw_prx_data.c','src/pw_prx_data.h','native/pw_physical_shared.h','native/pw_dmem_share.h','src/pw_shared_page.h','src/pw_memory_file.c','src/pw_memory_file.h','src/pw_memory_service.c','src/pw_memory_service.h','wine/ps5/pw_wine_process.h','wine/ps5/pw_payload_rendezvous.h','wine/ps5/pw_wine_process_io.h','src/pw_gpu_broker.h','src/pw_helper_sched.c','src/pw_helper_sched.h','src/pw_cpu_placement.c','src/pw_cpu_placement.h','src/pw_prx_elf.c','src/pw_prx_elf.h','native/pw_prx_elf_ps5.c','native/pw_prx_elf_ps5.h','src/pw_firmware.c','src/pw_firmware.h','native/pw_firmware_ps5.c','src/pw_log_sessions.h','wine/ps5/pw_wine_threads.h','wine/ps5/pw_wine_perf.h','tools/build-payload-loader.sh']
 manifest={'graphics_foundation_revision':(root/'.deps/graphics-foundation/.revision').read_text().strip(),'payload':True,'gpu_broker':True,'sdk_revision':(sdk/'.ps5-sdk-revision').read_text().strip(),'sha256':digest(out),'sources':{n:digest(root/n) for n in inputs}}
 out.with_suffix('.json').write_text(json.dumps(manifest,indent=2)+'\n')
 PYMANIFEST

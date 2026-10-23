@@ -1,5 +1,15 @@
 # Plan
 
+## System-pool budget: class the census, cap Chromium renderers, move `.prx.elf` data (2026-10-23, no console run)
+
+Sharing JIT does not lower `sceKernelGetResidentFmemCount`, and execute does not stick on the application pool.
+[`docs/FMEM_BUDGET.md`](FMEM_BUDGET.md) is the measurement, the expected MiB, and the install. A helper now logs
+`wine-child: fmem pid=` (`src/pw_fmem_census.h`, `tools/fmem-breakdown.py`). The title's ntdll refuses a Chromium
+`--type=renderer` past `WINE_PS5_RENDERER_LIMIT` (default 2). Patch 1250 writes the same switches MihawkBrowser
+already uses into the browser process's command line. Non-executable runs of a user-space `.prx.elf` move onto
+`sceKernelAllocateDirectMemoryForApp` unless `WINE_PS5_PRX_DATA_DMEM=0`. Host tests `pw_fmem_budget`,
+`pw_fmem_census`, `pw_prx_data`. Not run on a console. No SDK in this environment, so no `ntdll.prx.elf` hash.
+
 ## Raw system-memory spikes, and a prefix saved before SIGKILL (2026-10-22, no console run)
 
 The flexible-pressure guard below is unchanged. Beside it, the title samples the raw resident census about every 200 ms
