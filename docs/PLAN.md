@@ -1,3 +1,41 @@
+## Keep call [0x7ffe1000] and repair a rewritten stub (2026-10-23, no console run)
+
+1255 was installed and the hashes match the table in the next section: `ntdll.prx.elf` `a586cf87`, `ntdll.prx` `8ce100e8`, `ntdll.dll` `63b7dab8`. Mihawk itself then stayed on a black screen, before WoW and Battle.net. A log pull returned nothing. `ps5_arm_ntdll_syscalls` had stored `KUSER_SHARED_DATA.SystemCall` as 0 after rewriting every thunk to `cd 2e`, so every ntdll syscall, including process startup and the shell, executed `int 2e`.
+
+This build leaves the file's `0f 05` bytes in place and leaves `SystemCall` at 1. `jne +3` reaches `call [0x7ffe1000]`. That is the path Mihawk, explorer and Battle.net already ran under 1254. The initializer in `virtual_init_user_shared_data` stays 1. If bit 0 of the shared dword is clear, `ps5_keep_system_call` stores `value|1` through the read-only view. It does not store 0. A fresh image has 258 `75 03 0f 05` sites. A site that is already `75 03 cd 2e` is written back to `0f 05`. Other `0f 05` bytes stay.
+
+The WowB fault is still the one stub. The loader stored byte `0x5c` at `ntdll+0x58340`, which is `pop rsp` over `4c 8b d1`. That loads the guest return address into `rsp` before the flag test. `SystemCall` is still 1, so the thunk still calls the dispatcher, and the epilogue would return to the `ret` at `+0x14` with that `rsp`. Before the fifth argument is read, the dispatcher compares `frame->rsp` with the TEB stack. `StackBase` is `TEB+0x08` and `StackLimit` is `TEB+0x10`. A range that is not set yet (`StackBase <= StackLimit`) stays on the fast path, so the check does not run before the stack exists. An `rsp` inside `[StackLimit, StackBase)` and 8-aligned stays on the fast path: those compares, no C call, and no change to the frame. An `rsp` outside that range, or not 8-aligned, switches to the kernel stack and calls `ps5_repair_patched_stub`. The smashed `rsp` cannot take that call. The function changes `rsp` and `r10` only when the 32 bytes at `frame->rip-0x14` are still the Wine thunk (`c3` at `+0x14`, `75 03` at `+0x10`, `call [0x7ffe1000]` at `+0x18`) and the first three bytes are no longer `4c 8b d1`. The prefix `5c 8b d1` means `mov r10, rcx` did not run. The entry saved the guest `rcx` in `r11`, and the repair stores it in `r10` and in `frame->r10`. The qword that `pop rsp` loaded is still in the thread stack. The lowest 8-aligned slot that holds it becomes `frame->rsp`, and the epilogue's `ret` pops the guest return address. `rdx` was already `mov edx, ecx` and is not recovered. A return that is outside the stack but is not that thunk logs a skip and leaves the saved `rsp` and `r10` alone. The `int 2e` emulator stays for a faulting `0f 05` or `cd 2e` inside ntdll. Startup does not execute those instructions. The 32-bit dispatcher is unchanged.
+
+Every process that loads ntdll writes these lines, before guest code:
+
+`wine-ps5: syscall-boot systemcall=%#x`
+
+`wine-ps5: syscall-arm ntdll syscall=%u int2e=%u systemcall=%#x path=call`
+
+`wine-ps5: signal-init systemcall=%#x`
+
+`wine-ps5: signal-init handlers=ready`
+
+`path=call` is the fast path. The repair log, at most 32 lines, is `wine-ps5: stub-repair id=%#x stub=%p head=%02x%02x%02x rsp=%p slot=%p slots=%u r10=%#llx rdx=%#llx`. A skip, at most 8 lines, is `wine-ps5: stub-repair skip rip=%p rsp=%p r10=%#llx why=not-thunk`. The two share one counter. A depth counter returns immediately if the repair is re-entered.
+
+Which processes take the repair: the C function runs only when `frame->rsp` is outside the thread stack or is not 8-aligned. It changes `rsp` and `r10` only for a rewritten ntdll thunk. The Mihawk shell, explorer, service processes, wineserver clients, and Battle.net stay on `call [0x7ffe1000]` and do not enter it. A WowB syscall whose stub is still `4c 8b d1` stays there too, including the two `NtSetIoCompletion` returns through `caller=ntdll+0x5835f` that 1254 logged, because those returned with `rsp` inside the thread stack. A thread whose TEB stack is not set yet stays there. The repaired entry is the WowB wine-child after `image-writecopy` at `ntdll+0x58340` (`NtSetIoCompletion`, id `0x1a3`). Other stubs in that process stay on the fast path until their own first byte is rewritten. 32-bit code uses `signal_i386.c` and does not take this path.
+
+Syscall numbers stay the 19045 table. The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The compare of protocol `0x3a3` is still the one instruction `81 fe a3 03 00 00` at VA `0x35f70`. `movl $0x3a3, %edx` is still the one instruction `ba a3 03 00 00` at VA `0x36284`. `.text` holds the dword `a3 03 00 00` three times: those two immediates, and the displacement of a `je` at VA `0x90e63` (`0f 84 a3 03 00 00`). That `je` was at `0x90863` in the 1255 image. There is no compare of `0x3a2`. The whole file holds the dword 42 times. Thirty-seven of the rest are in `.debug_loc` (18), `.debug_info` (13), `.debug_ranges` (4), `.debug_aranges` (1) and `.debug_line` (1). The 1255 image had 31, with `.debug_info` at 3 and `.debug_ranges` at 3. The other two sit in `.dynsym` and `.symtab`. The PE image was not rebuilt: `SizeOfImage` stays `0x2d5000`, the file stays 3,211,264 bytes, hash `63b7dab8`. wineserver was not rebuilt. The 32-bit ntdll and wow64 were not rebuilt.
+
+`file.o` in this unix image is the tree's `file.c`. `NtQueryDirectoryFile`, when `server_get_unix_fd` returns `STATUS_BAD_DEVICE_TYPE`, sends request 244. This wineserver's handler table slot 244 is `req_query_directory_file`. The 1255 link used an older `file.o` that did not contain that call. `cdrom.c`, `debug.c` and `env.c` were recompiled from the same sources as that link. None of them sends a request whose number moved. The other unix objects are the ones that link already used.
+
+This build was not run on a console. Mihawk's startup is not claimed back, and the return to Play is not claimed gone. The next pull's `syscall-boot`, `syscall-arm` with `path=call`, and `signal-init handlers=ready` are what show the shell took the fast path. A `stub-repair` line is what shows the rewritten thunk.
+
+Install the new unix files with the `63b7dab8` `ntdll.dll`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `63b7dab8c8e872cb375a0d051c5b8eb97ec744e88f31a0ea229c1f6e7f1bd3e4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,438,628 | `860847d43a9f2caa852772e44b92aab811db0bc893e8bf402fb912d21d2c4228` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,226,626 | `869acc75d5f3f4995ef45e3b0bb98834af916914211807d4165df726d0742fd9` |
+
+The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,915,192 bytes, `8669d33ed6540d0ac3d486323a86a405eeab66bd5b89471049c235f98f2899f4`.
+
 ## SystemCall 0 and the stub-byte dump (2026-10-23, no console run)
 
 1254 was installed and the hashes match the table in the next section: `ntdll.dll` `63b7dab8`, `ntdll.prx.elf` `e21e5c4d`, `ntdll.prx` `a706e789`. `wine-ps5: syscall-arm ntdll count=258` is in every wine-child, about 33 processes, so the rewrite loaded. There is no `syscall-emu` line. WoW shows Launching and returns to Play. The newest Crash.txt is still `_classic_beta_` `15.45.38`. wine-child 1133 and 1135 are the two WowB processes and they carry the same fault.
