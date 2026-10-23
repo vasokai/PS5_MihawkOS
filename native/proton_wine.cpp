@@ -141,6 +141,7 @@ int session_result = -1;
 int (*session_connect)(const char *) = nullptr;
 int (*session_start_root)(int,const char *,const char *,const char *,int,const char *const *) = nullptr;
 int (*session_root_present)() = nullptr;
+int (*session_root_pid)() = nullptr;
 int (*session_unload_root)() = nullptr;
 // The owner's GPU broker, stopped on the way back to the launcher once every child has gone.
 bool owner_broker_running = false;
@@ -1898,9 +1899,12 @@ void proton_run_wine()
         // The desktop session restarts its root later through the same means (src/pw_desktop_session.h).
         session_connect=connect_server;session_start_root=start_root;
         session_root_present=symbol<int (*)()>("pw_ps5_root_present");
+        session_root_pid=symbol<int (*)()>("pw_ps5_root_pid");
         session_unload_root=symbol<int (*)()>("pw_ps5_unload_root");
         if(desktop_session && (!session_root_present || !session_unload_root))
             say("Mihawk: this runtime cannot unload the desktop; game mode keeps it loaded");
+        if (desktop_session && !session_root_pid)
+            say("Wine: this runtime does not name the desktop root; the pool cannot exempt it by pid");
         const int socket=connect_server((runtime+"/share/wine/nls").c_str());
         if(socket<0) fail("PS5_PROTON_OWNER_BOOTSTRAP FAIL server connection");
         const int launched=start_root(socket,modules.c_str(),prefix.c_str(),cwd,config.argc,config.argv);
@@ -2018,22 +2022,21 @@ void proton_run_wine()
                           getenv("PROTON_SYSTEM_POOL_SPIKE"), getenv("PROTON_HANG_DISPLAY_WARN_MS"), &pool_config);
     PwSystemPool pool_state{};
     const char *pool_label = pool_config.off ? "off" : "fine";
-    // Helper charges last sample, and the live raw figure over the last half second, so a spike is
-    // visible inside 200 ms even when the memory helper's census is still the previous half second.
+    // Helper charges last sample, and the guarded figure over the last half second. The census is the
+    // memory helper's, up to half a second old; helper flexible growth is not added on top, because that
+    // growth is what direct memory already explains on a launcher.
     PwPoolCharge pool_seen[PW_HANG_MAX_HELPERS]{};
     unsigned pool_seen_count = 0;
-    uint64_t pool_census_base = 0, pool_helper_base = 0;
-    uint32_t pool_census_seq = 0;
-    int pool_census_ready = 0;
     struct { uint64_t ms, live; } pool_hist[4]{};
     unsigned pool_hist_i = 0;
     if (pool_config.off)
         say("Wine: system pool governor off");
     else
-        say("Wine: system pool governor warn %u MiB, kill %u MiB, spike %u MiB, pause %u ms, release %u MiB; "
-            "a rise pauses the helper that grew; display watchdog warn %u ms, act %u ms",
+        say("Wine: system pool governor warn %u MiB, kill %u MiB (the hard end), spike %u MiB, pause %u ms, "
+            "release %u MiB; it watches the guarded figure and never pauses the desktop root; "
+            "display watchdog warn %u ms, act %u ms when the raw census is at the %u MiB firmware limit",
             pool_config.warn_mib, pool_config.kill_mib, pool_config.spike_mib, pool_config.spike_hold_ms,
-            pool_config.release_mib, pool_config.display_warn_ms, pool_config.display_ms);
+            pool_config.release_mib, pool_config.display_warn_ms, pool_config.display_ms, default_limit);
     pw_memory_guard memory_guard{};
     pw_memory_guard_init(&memory_guard, memory_limit, memory_end);
     PwMemoryPressure memory_pressure{};
@@ -2062,8 +2065,8 @@ void proton_run_wine()
             "; PROTON_HANG_BREAKER=0, so it only reports", breaker_freeze_ms ? "; test: the census is taken as frozen" : "");
         if (pool_config.display_ms)
             say("Wine: display watchdog armed: warn at %u ms, end the Windows session at %u ms with no new frame "
-                "while the title waits in vmwait or system memory is at the %u MiB limit",
-                pool_config.display_warn_ms, pool_config.display_ms, pool_config.kill_mib);
+                "while the title waits in vmwait or the raw census is at the %u MiB firmware limit",
+                pool_config.display_warn_ms, pool_config.display_ms, default_limit);
         else
             say("Wine: display watchdog off");
 #endif
@@ -2078,7 +2081,7 @@ void proton_run_wine()
         // thread, which kept running when this loop did not.
         flight.display_stall_ms = pool_config.display_ms;
         flight.display_warn_ms = pool_config.display_warn_ms;
-        flight.pressure_mib = pool_config.kill_mib;
+        flight.pressure_mib = default_limit;
         flight.notice = hang_notice;
         flight.warn_notice = hang_warn_notice;
         if (programs_in_helpers && breaker_acts) flight.end_helpers = end_helpers;
@@ -2469,40 +2472,53 @@ void proton_run_wine()
                 }
             }
         }
-        // The raw resident figure, every 200 ms (24 ticks of this 8333 us loop). The memory helper publishes
-        // its census every half second; helper growth since that census is added here, so a renderer that has
-        // just started is visible before the next census. A steady level under the firmware limit is left
-        // alone. A rise pauses the helper that grew. The title is never signalled.
+        // The guarded figure, every 200 ms (24 ticks of this 8333 us loop): the resident census minus
+        // direct-memory growth since the start, the same subtraction the flexible guard uses. The raw
+        // census on a launcher climbs past the firmware limit while this figure stays near the idle
+        // desktop. At or below the warn line nothing is paused. A climb within one spike of the hard
+        // end, or the hard end itself, pauses the helper that grew. The title and the desktop root
+        // (explorer) are never signalled.
         if (tick % 24 == 0 && !pool_config.off) {
             pw_memory_census live_census = census;
             if (memory_census && !memory_census(&live_census)) census = live_census;
+            const int shell = desktop_session && session_root_pid ? session_root_pid() : 0;
             PwPoolCharge charges[PW_HANG_MAX_HELPERS];
             unsigned charge_count = 0;
             int newest = 0, memory_pid = 0, target = 0, grower = 0;
-            uint64_t newest_bytes = 0, helper_sum = 0, grew = 0;
+            uint64_t newest_bytes = 0, grew = 0;
             pool_charges(charges, PW_HANG_MAX_HELPERS, &charge_count, &newest, &newest_bytes, &memory_pid);
             for (unsigned i = 0; i < charge_count; ++i) {
                 uint64_t previous = 0;
                 int known = 0;
-                helper_sum += charges[i].bytes;
                 for (unsigned s = 0; s < pool_seen_count; ++s)
                     if (pool_seen[s].pid == charges[i].pid) { previous = pool_seen[s].bytes; known = 1; break; }
                 const uint64_t delta = !known ? charges[i].bytes : charges[i].bytes > previous ? charges[i].bytes - previous : 0;
-                if (delta > grew && charges[i].pid > 1 && charges[i].pid != getpid() && charges[i].pid != memory_pid) {
+                if (delta > grew && charges[i].pid > 1 && charges[i].pid != getpid() && charges[i].pid != memory_pid &&
+                    charges[i].pid != shell) {
                     grew = delta;
                     grower = charges[i].pid;
                 }
             }
             pool_seen_count = charge_count < PW_HANG_MAX_HELPERS ? charge_count : PW_HANG_MAX_HELPERS;
             for (unsigned i = 0; i < pool_seen_count; ++i) pool_seen[i] = charges[i];
-            if (!pool_census_ready || census.sequence != pool_census_seq) {
-                pool_census_seq = census.sequence;
-                pool_census_base = census.system;
-                pool_helper_base = helper_sum;
-                pool_census_ready = 1;
+            uint64_t live = census.system;
+            if (!memory_choice.raw) {
+                PwMemoryPressureIn pressure_in{};
+                struct ps5_memory_stats pools{};
+                pressure_in.census = census.system;
+                pressure_in.flexible_free = UINT64_MAX;
+                if (ps5_memory_query(&pools)) {
+                    pressure_in.direct_total = pools.total_bytes;
+                    pressure_in.direct_free = pools.free_bytes;
+                    pressure_in.flexible_free = pools.flexible_bytes;
+                }
+                pressure_in.backstop = (uint64_t)(memory_limit > PW_MEMORY_CENSUS_BACKSTOP_MIB ? memory_limit
+                                                                                              : PW_MEMORY_CENSUS_BACKSTOP_MIB) << 20;
+                pressure_in.flexible_reserve = (uint64_t)PW_MEMORY_FLEXIBLE_RESERVE_MIB << 20;
+                pressure_in.attribute_direct = 1;
+                pw_memory_pressure_sample(&memory_pressure, &pressure_in, &memory_pressure_now);
+                live = memory_pressure_now.guarded;
             }
-            uint64_t live = pool_census_base;
-            if (helper_sum > pool_helper_base) live += helper_sum - pool_helper_base;
             const uint64_t now = monotonic_ms();
             uint64_t rise = 0, oldest_ms = now, oldest_live = live;
             int window = 0;
@@ -2514,38 +2530,39 @@ void proton_run_wine()
             pool_hist[pool_hist_i++ % 4] = {now, live};
             if (!grower)
                 grower = pw_system_pool_victim(charges, charge_count, census.largest_pid, census.largest,
-                                               newest, newest_bytes, getpid(), memory_pid);
-            const int action = pw_system_pool_sample(&pool_state, &pool_config, live, rise, now, grower, getpid(), &target);
+                                               newest, newest_bytes, getpid(), memory_pid, shell);
+            const int action = pw_system_pool_sample(&pool_state, &pool_config, live, rise, now, grower, getpid(),
+                                                     shell, &target);
             const unsigned long long live_mib = live >> 20;
             const unsigned long long rise_mib = rise >> 20;
             if (action == PW_POOL_WARN) {
                 pool_label = "warn";
                 notice_set(NOTICE_POOL_WARN, "The PS5's system memory is nearly full.");
-                say("Wine: system pool warn: live %llu MiB, warn %u MiB, no helper can be paused",
+                say("Wine: system pool warn: guarded %llu MiB, warn %u MiB, no helper can be paused",
                     live_mib, pool_config.warn_mib);
             } else if (action == PW_POOL_SUSPEND) {
                 pool_label = "pause";
                 const int status = signal_process(target, SIGSTOP);
                 notice_set(NOTICE_POOL_SUSPEND, "The PS5's system memory spiked: one Windows program was paused "
                            "so the console would keep drawing.");
-                say("Wine: system pool suspend: live %llu MiB, rose %llu MiB in the last half second, "
+                say("Wine: system pool suspend: guarded %llu MiB, rose %llu MiB in the last half second, "
                     "pausing process %d (errno %d)", live_mib, rise_mib, target, status);
             } else if (action == PW_POOL_KILL) {
                 pool_label = "kill";
                 const int status = signal_process(target, SIGKILL);
                 notice_set(NOTICE_POOL_KILL, "The PS5's system memory stayed full: one Windows program was ended.");
-                say("Wine: system pool kill: live %llu MiB, kill %u MiB, SIGKILL %d (errno %d)",
+                say("Wine: system pool kill: guarded %llu MiB, kill %u MiB, SIGKILL %d (errno %d)",
                     live_mib, pool_config.kill_mib, target, status);
             } else if (action == PW_POOL_RESUME) {
                 pool_label = "fine";
                 const int status = signal_process(target, SIGCONT);
-                say("Wine: system pool resume: live %llu MiB, continuing process %d (errno %d)",
+                say("Wine: system pool resume: guarded %llu MiB, continuing process %d (errno %d)",
                     live_mib, target, status);
             } else if (action == PW_POOL_CLEAR) {
                 pool_label = "fine";
                 const unsigned under = pool_config.release_mib >= pool_config.warn_mib ? 0
                     : pool_config.warn_mib - pool_config.release_mib;
-                say("Wine: system pool clear: live %llu MiB, under %u MiB", live_mib, under);
+                say("Wine: system pool clear: guarded %llu MiB, under %u MiB", live_mib, under);
             }
         }
 #ifdef PS5_GPU_BROKER

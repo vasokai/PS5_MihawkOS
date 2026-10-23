@@ -158,19 +158,21 @@ flexible-pool floor and the raw-census backstop. A value above the firmware
 default is kept. A program launched from the desktop does not change the title's
 guard by its own `game.json`.
 
-The raw resident figure has its own governor (`src/pw_system_pool.h`), because the
-subtraction above can leave it past the firmware mark while flexible memory is still
-free. The title reads it about every 200 ms, counting helper growth since the last
-census. A steady figure under the firmware limit is left alone. Firmware 12's warn line
-is 1450 MiB and its kill line is 1600 MiB. A rise of 32 MiB at or above the warn line,
-any rise within 32 MiB of the kill line, or the kill line itself, SIGSTOPs the helper
-that grew. Still at the kill line 250 ms later, that helper is SIGKILLed. The title and
-the memory helper are never signalled. The helper is the newest when the per-process
-flexible charges match, and the largest when one charge is at least 64 MiB above the
-newest, at least twice it, and at least 96 MiB. It stands down 64 MiB below the warning
-and continues a paused helper. The flight recorder warns at 2 s and ends the Windows
-helpers at 5 s when the picture has already been shown once and then shows nothing new,
-and either the title waits in `vmwait` or the raw census is already at the kill line.
+The guarded figure has its own governor (`src/pw_system_pool.h`), for a climb of flexible
+memory the subtraction above does not explain. The title reads that figure about every
+200 ms. At or below the firmware limit nothing is paused: an idle desktop near 1460 MiB,
+and a launcher whose raw census is past 1600 while the guarded figure is not, keep
+running. Firmware 12's warn line is 1600 MiB and its kill line is the hard end, 1670 MiB.
+A rise of 32 MiB while already above the warn line and within 32 MiB of that end, or the
+end itself, SIGSTOPs the helper that grew. Still at the end 250 ms later, that helper is
+SIGKILLed. The title, the memory helper, and the desktop root are never signalled. The
+helper is the newest when the per-process flexible charges match, and the largest when
+one charge is at least 64 MiB above the newest, at least twice it, and at least 96 MiB.
+It stands down 64 MiB below the warning and continues a paused helper. The flight
+recorder warns at 2 s and ends the Windows helpers at 5 s when the picture has already
+been shown once and then shows nothing new, and either the title waits in `vmwait` or
+the raw census is already at the firmware limit (1600 MiB on firmware 12; the watchdog
+keeps that mark).
 The title posts a notice. Before that SIGKILL the registry is flushed and the prefix
 directory is fsynced, and the prefix's files are synced in the background every 30 s.
 The same `memory.conf` keys (`PROTON_SYSTEM_POOL`, `PROTON_SYSTEM_POOL_WARN`,

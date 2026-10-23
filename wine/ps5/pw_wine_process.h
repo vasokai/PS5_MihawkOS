@@ -150,6 +150,9 @@ int pw_ps5_root_result(void);
 /* The title's desktop session (src/pw_desktop_session.h): whether the root runs, and ending it on purpose (game mode);
  * its exit is then not the result above. pw_ps5_unload_root: 0 when asked, -1 with ESRCH without a root. */
 int pw_ps5_root_present(void);
+/* The root's native pid, 0 when none is alive. The title's pool governor uses it so a desktop session never
+ * SIGSTOPs explorer. Holds child_lock only; allocates nothing. */
+int pw_ps5_root_pid(void);
 int pw_ps5_unload_root(void);
 /* The title: the native pids of the helpers that run Windows programs (every slot with service > 0 and pid > 0, closing
  * or not), up to capacity, and in *memory_pid (may be NULL) the memory helper's, 0 when there is none. Returns how many

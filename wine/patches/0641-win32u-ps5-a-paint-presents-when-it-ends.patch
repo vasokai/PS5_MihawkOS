@@ -1,0 +1,136 @@
+From 8c1a0c0e0b7e4f5a9d2c6b1e0a7f4d3c2b1a0908 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Fri, 23 Oct 2026 07:30:00 +0000
+Subject: [PATCH] win32u: Present a finished paint on the PS5 when it ends.
+
+The PS5 shows a window when its surface is flushed, and the image is the
+one DIB the window keeps. A desktop WM_PAINT is many GDI calls. Flushing on
+the first unlock 16 ms after the previous flush published that DIB halfway
+through the erase, the icons or the rubber band, so the desktop blinked
+while the pointer moved. While BeginPaint has not reached EndPaint, an
+unlock waits. EndPaint publishes the finished frame. A thread that draws
+without BeginPaint still flushes every 16 ms, which is what shows a 24 fps
+cinematic at 24.
+
+Rebased onto 1c7859662533 for PS5_Proton (see wine/patches/README.md).
+---
+ dlls/win32u/dce.c       | 58 +++++++++++++++++++++++++++++++++++++++++++------
+ dlls/win32u/dibdrv/dc.c | 10 ++++++---
+ 2 files changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -32,9 +32,26 @@
+ #include "wine/opengl_driver.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
++#ifdef WINE_PS5_USER_DRIVER
++#include "pw_gdi_present.h"
++#endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
+ 
++#ifdef WINE_PS5_USER_DRIVER
++__thread unsigned pw_gdi_paint_depth;
++
++static void pw_gdi_paint_enter(void)
++{
++    pw_gdi_paint_depth++;
++}
++
++static void pw_gdi_paint_leave(void)
++{
++    if (pw_gdi_paint_depth) pw_gdi_paint_depth--;
++}
++#endif
++
+ struct dce
+ {
+     struct list entry;         /* entry in global DCE list */
+@@ -1771,9 +1788,19 @@
+     RECT rect;
+     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
+ 
++#ifdef WINE_PS5_USER_DRIVER
++    /* Cover the erase inside BeginPaint: that drawing is not a finished frame. */
++    pw_gdi_paint_enter();
++#endif
+     NtUserHideCaret( hwnd );
+ 
+-    if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
++    if (!(hrgn = send_ncpaint( hwnd, NULL, &flags )))
++    {
++#ifdef WINE_PS5_USER_DRIVER
++        pw_gdi_paint_leave();
++#endif
++        return 0;
++    }
+ 
+     erase = send_erase( hwnd, flags, hrgn, &rect, &hdc );
+ 
+@@ -1782,6 +1809,9 @@
+     if (!ps)
+     {
+         release_dc( hwnd, hdc, TRUE );
++#ifdef WINE_PS5_USER_DRIVER
++        pw_gdi_paint_leave();
++#endif
+         return 0;
+     }
+     ps->fErase = erase;
+@@ -1798,9 +1828,22 @@
+     struct window_surface *surface;
+ 
+     NtUserShowCaret( hwnd );
++#ifdef WINE_PS5_USER_DRIVER
++    pw_gdi_paint_leave();
++    /* flush_window_surfaces does nothing while this thread has drawn within 50 ms,
++     * which a drag never stops doing. Publish this window's finished frame now.
++     * A nested paint still in progress keeps the other surfaces for its own EndPaint. */
++    if (!pw_gdi_paint_depth)
++#endif
+     flush_window_surfaces( FALSE );
+-    if ((surface = window_surface_get( hwnd ))) window_surface_release( surface );
+-    else                                        user_driver->pProcessEvents( 0 );
++    if ((surface = window_surface_get( hwnd )))
++    {
++#ifdef WINE_PS5_USER_DRIVER
++        window_surface_flush( surface );
++#endif
++        window_surface_release( surface );
++    }
++    else user_driver->pProcessEvents( 0 );
+     if (!ps) return FALSE;
+     release_dc( hwnd, ps->hdc, TRUE );
+     return TRUE;
+diff --git a/dlls/win32u/dibdrv/dc.c b/dlls/win32u/dibdrv/dc.c
+--- a/dlls/win32u/dibdrv/dc.c
++++ b/dlls/win32u/dibdrv/dc.c
+@@ -30,6 +30,9 @@
+ #include "wine/unixlib.h"
+ #include "wine/wgl.h"
+ #include "wine/debug.h"
++#ifdef WINE_PS5_USER_DRIVER
++#include "pw_gdi_present.h"
++#endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dib);
+ 
+@@ -548,11 +551,13 @@
+     {
+ #ifdef WINE_PS5_USER_DRIVER
+         DWORD now = NtGetTickCount();
+-        BOOL flush = now - surface->draw_start_ticks >= FLUSH_PERIOD;
++        /* Inside BeginPaint the DIB is halfway through the paint. EndPaint publishes
++         * the finished frame. A thread that never paints still flushes each period. */
++        int present = pw_gdi_present_on_unlock( pw_gdi_paint_depth, now, surface->draw_start_ticks, FLUSH_PERIOD );
+ 
+-        if (flush) surface->draw_start_ticks = now;
++        if (present == PW_GDI_PRESENT_PERIOD) surface->draw_start_ticks = now;
+         window_surface_unlock( surface );
+-        if (flush) window_surface_flush( dev->surface );
++        if (present == PW_GDI_PRESENT_PERIOD) window_surface_flush( dev->surface );
+ #else
+         DWORD ticks = NtGetTickCount() - surface->draw_start_ticks;
+         window_surface_unlock( surface );
