@@ -1,0 +1,163 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: a parked file answers file queries as the file
+
+An idle file keeps its descriptor number, held by a socket, and is reopened on
+the next use (pw_wine_fdv.h). fstat of that placeholder is not a regular file
+or a directory, so open_fd stored no inode and no unix name and
+file_get_fd_type returned FD_TYPE_CHAR.
+
+get_handle_unix_name, set_fd_name, set_fd_disposition, file_open_file and
+NtCreateFile by file id then wrote STATUS_OBJECT_TYPE_MISMATCH (0xC0000024)
+into an IO_STATUS_BLOCK. Stock Wine statted the path. FileBasicInformation
+and FileStatInformation on the placeholder returned STATUS_INVALID_INFO_CLASS
+instead, and FileStandardInformation, FileAllInformation and
+FileNetworkOpenInformation filled from the socket. FileNameInformation uses
+the NT name.
+
+The path is now what those queries answer as, when it is a regular file or a
+directory (wine/ps5/pw_wine_file_query.h). A real socket, fifo or device stays
+a special file. ntsync objects, consoles and d3dkmt are unchanged: stock Wine
+returns STATUS_OBJECT_TYPE_MISMATCH for them too. No console run; the decision
+is host-tested in tests/test_pw_file_query.c.
+---
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -3591,6 +3591,10 @@
+ }
+ 
+ 
++#ifdef __PROSPERO__
++#include "pw_wine_file_query.h"
++#endif
++
+ /******************************************************************************
+  *           file_id_to_unix_file_name
+  *
+@@ -3621,10 +3625,40 @@
+         goto done;
+ 
+     if (type != FD_TYPE_DIR)
++#ifdef __PROSPERO__
++    {
++        struct stat live;
++
++        /* The stored type follows the descriptor held at open. A park placeholder is a socket, so a directory
++         * was stored as FD_TYPE_CHAR, and fdopendir is not wrapped. If this descriptor is the directory, use
++         * it. If it is still the placeholder, open the path. A root that is not a directory still returns
++         * STATUS_OBJECT_TYPE_MISMATCH, as stock Wine does. */
++        if (fstat( root_fd, &live ) || pw_file_query_kind( live.st_mode, 0 ) != PW_FILE_QUERY_DIRECTORY)
++        {
++            char *root_name = NULL;
++            struct stat path_st;
++            int path_fd;
++
++            if (server_get_unix_name( attr->RootDirectory, &root_name ) || stat( root_name, &path_st ) ||
++                pw_file_query_kind( 0, path_st.st_mode ) != PW_FILE_QUERY_DIRECTORY ||
++                (path_fd = open( root_name, O_RDONLY | O_DIRECTORY )) < 0)
++            {
++                free( root_name );
++                status = STATUS_OBJECT_TYPE_MISMATCH;
++                goto done;
++            }
++            if (needs_close) close( root_fd );
++            root_fd = path_fd;
++            needs_close = TRUE;
++            free( root_name );
++        }
++    }
++#else
+     {
+         status = STATUS_OBJECT_TYPE_MISMATCH;
+         goto done;
+     }
++#endif
+ 
+     fstat( root_fd, &root_st );
+     if (root_st.st_ino == file_id)  /* shortcut for "." */
+@@ -5162,6 +5196,35 @@
+ }
+ 
+ 
++#ifdef __PROSPERO__
++/* The live descriptor may be a park placeholder. FileBasicInformation would then return
++ * STATUS_INVALID_INFO_CLASS, and FileStandard / FileAll / FileNetworkOpen would describe the socket.
++ * The path the server opened is the file stock Wine statted. Defined before the macro below, so this
++ * call is the real fd_get_file_info. */
++static int ps5_stat_query_target( HANDLE handle, int fd, unsigned int options,
++                                  struct stat *st, ULONG *attr, ULONG *reparse_tag )
++{
++    int ret = fd_get_file_info( handle, fd, options, st, attr, reparse_tag );
++    struct stat path_st;
++    char *name;
++
++    if (ret == -1) return ret;
++    if (pw_file_query_kind( st->st_mode, 0 ) != PW_FILE_QUERY_SPECIAL) return ret;
++    if (server_get_unix_name( handle, &name )) return ret;
++    if (!stat( name, &path_st ) &&
++        pw_file_query_kind( st->st_mode, path_st.st_mode ) != PW_FILE_QUERY_SPECIAL)
++    {
++        *st = path_st;
++        if (attr) *attr = get_file_attributes( st );
++    }
++    free( name );
++    return ret;
++}
++#define fd_get_file_info(handle, fd, options, st, attr, tag) \
++    ps5_stat_query_target(handle, fd, options, st, attr, tag)
++#endif
++
++
+ /******************************************************************************
+  *              NtQueryInformationFile   (NTDLL.@)
+  */
+@@ -5421,6 +5484,9 @@
+     return io->Status = status;
+ }
+ 
++#ifdef __PROSPERO__
++#undef fd_get_file_info
++#endif
+ 
+ /******************************************************************************
+  *              NtSetInformationFile   (NTDLL.@)
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -1927,6 +1927,9 @@
+     name->len = fd->nt_namelen;
+ }
+ 
++#ifdef __PROSPERO__
++#include "pw_wine_file_query.h"
++#endif
+ /* open() wrapper that returns a struct fd with no fd user set */
+ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
+                     int flags, mode_t *mode, unsigned int access,
+@@ -2009,7 +2012,28 @@
+ 
+     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
+     fd->unix_name = NULL;
++#ifdef __PROSPERO__
++    /* A parked descriptor is a socket. Classifying it as a special file drops the inode and the unix name,
++     * and get_handle_unix_name, set_fd_name, set_fd_disposition, file_open_file and an open by file id then
++     * return STATUS_OBJECT_TYPE_MISMATCH. The path is the file stock Wine statted. A real socket, fifo or
++     * device, whose path is not a file or a directory, stays a special file. */
++    if (fstat( fd->unix_fd, &st )) memset( &st, 0, sizeof(st) );
++    if (pw_file_query_kind( st.st_mode, 0 ) == PW_FILE_QUERY_SPECIAL)
++    {
++        char *opened = dup_fd_name( root, name );
++        struct stat path_st;
++
++        if (opened)
++        {
++            if (!stat( opened, &path_st ) &&
++                pw_file_query_kind( st.st_mode, path_st.st_mode ) != PW_FILE_QUERY_SPECIAL)
++                st = path_st;
++            free( opened );
++        }
++    }
++#else
+     fstat( fd->unix_fd, &st );
++#endif
+     *mode = st.st_mode;
+ 
+     /* only bother with an inode for normal files and directories */

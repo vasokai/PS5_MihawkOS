@@ -1,0 +1,384 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: pin a parked file before stat and keep its unix name
+
+realpath can fail after stat succeeded, and unix_name was then NULL, so
+get_handle_unix_name, WineFileUnixNameInformation, set_fd_name, file_open_file
+and the reparse FSCTLs still returned STATUS_OBJECT_TYPE_MISMATCH. The
+normalised path is kept.
+
+NtQueryInformationFile stopped when the server had no unix name.
+create_file_for_fd handles have none, so FileBasicInformation stayed
+STATUS_INVALID_INFO_CLASS and FileStandardInformation described the socket.
+get_view_file stored the live mode, so a parked module was FD_TYPE_CHAR:
+NtQueryDirectoryFile returned STATUS_INVALID_PARAMETER and a relative open
+returned STATUS_BAD_DEVICE_TYPE. Those paths pin the descriptor before fstat.
+A real socket, fifo or device is not tracked, so the pin does not change it.
+
+A mismatch that is still returned is one title-log line, at most 20 per
+process, naming the syscall, the info class and the handle type. Logging
+only. No console run; tests/test_pw_file_query.c covers the three decisions.
+---
+--- a/dlls/ntdll/unix/file.c
+
++++ b/dlls/ntdll/unix/file.c
+
+@@ -3668,6 +3668,7 @@
+ 
+ #ifdef __PROSPERO__
+ #include "pw_wine_file_query.h"
++#include "pw_wine_fdv.h"
+ #endif
+ 
+ /******************************************************************************
+@@ -3703,12 +3704,17 @@
+ #ifdef __PROSPERO__
+     {
+         struct stat live;
++        uint32_t pin = 0;
++        int live_is_dir;
+ 
+         /* The stored type follows the descriptor held at open. A park placeholder is a socket, so a directory
+-         * was stored as FD_TYPE_CHAR, and fdopendir is not wrapped. If this descriptor is the directory, use
+-         * it. If it is still the placeholder, open the path. A root that is not a directory still returns
+-         * STATUS_OBJECT_TYPE_MISMATCH, as stock Wine does. */
+-        if (fstat( root_fd, &live ) || pw_file_query_kind( live.st_mode, 0 ) != PW_FILE_QUERY_DIRECTORY)
++         * was stored as FD_TYPE_CHAR, and fdopendir is not wrapped. Pin first: fstat of the placeholder is not
++         * the directory. If it is still not a directory, open the path. A root that is not a directory still
++         * returns STATUS_OBJECT_TYPE_MISMATCH, as stock Wine does. */
++        pw_file_query_pin( root_fd, pw_wine_fdv && pw_wine_fdv->enter ? pw_wine_fdv->enter : NULL, &pin );
++        live_is_dir = !fstat( root_fd, &live ) && pw_file_query_kind( live.st_mode, 0 ) == PW_FILE_QUERY_DIRECTORY;
++        pw_file_query_unpin( pin, pw_wine_fdv ? pw_wine_fdv->leave : NULL );
++        if (!live_is_dir)
+         {
+             char *root_name = NULL;
+             struct stat path_st;
+@@ -5279,10 +5285,16 @@
+ static int ps5_stat_query_target( HANDLE handle, int fd, unsigned int options,
+                                   struct stat *st, ULONG *attr, ULONG *reparse_tag )
+ {
+-    int ret = fd_get_file_info( handle, fd, options, st, attr, reparse_tag );
++    uint32_t pin = 0;
+     struct stat path_st;
+     char *name;
++    int ret;
+ 
++    /* create_file_for_fd has no unix name, so the path fallback below cannot run. Pin first: FileBasic
++     * then sees the file, and FileStandard does not describe the socket. A real socket is not tracked. */
++    pw_file_query_pin( fd, pw_wine_fdv && pw_wine_fdv->enter ? pw_wine_fdv->enter : NULL, &pin );
++    ret = fd_get_file_info( handle, fd, options, st, attr, reparse_tag );
++    pw_file_query_unpin( pin, pw_wine_fdv ? pw_wine_fdv->leave : NULL );
+     if (ret == -1) return ret;
+     if (pw_file_query_kind( st->st_mode, 0 ) != PW_FILE_QUERY_SPECIAL) return ret;
+     if (server_get_unix_name( handle, &name )) return ret;
+@@ -9043,6 +9055,19 @@
+     return real_NtFlushBuffersFileEx( handle, flags, params, size, io );
+ }
+ 
++
++static void ps5_log_query_mismatch( const char *call, unsigned int class, unsigned int options,
++                                    NTSTATUS status, IO_STATUS_BLOCK *io )
++{
++    char line[192];
++
++    if (status != STATUS_OBJECT_TYPE_MISMATCH && !(io && io->Status == STATUS_OBJECT_TYPE_MISMATCH))
++        return;
++    if (!pw_file_query_note_mismatch( (unsigned long)getpid(), call, class, options, -1, line, sizeof(line) ))
++        return;
++    wine_write_stderr( line, strlen( line ) );
++}
++
+ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io, void *ptr, ULONG len, FILE_INFORMATION_CLASS class )
+ {
+     struct timespec begin;
+@@ -9052,13 +9077,18 @@
+     file_call_begin( &begin );
+     status = real_NtQueryInformationFile( handle, io, ptr, len, class );
+     file_call_end( FILE_CALL_INFORMATION, 0, &begin );
++    ps5_log_query_mismatch( "NtQueryInformationFile", class, 0, status, io );
+     return status;
+ }
+ 
+ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io, void *ptr, ULONG len, FILE_INFORMATION_CLASS class )
+ {
++    NTSTATUS status;
++
+     wb_flush_handle( handle );
+-    return real_NtSetInformationFile( handle, io, ptr, len, class );
++    status = real_NtSetInformationFile( handle, io, ptr, len, class );
++    ps5_log_query_mismatch( "NtSetInformationFile", class, 0, status, io );
++    return status;
+ }
+ 
+ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context, IO_STATUS_BLOCK *io, ULONG code, void *in_buffer, ULONG in_size, void *out_buffer, ULONG out_size )
+@@ -9094,6 +9124,7 @@
+     file_call_begin( &begin );
+     status = real_NtCreateFile( handle, access, attr, io, alloc_size, attributes, sharing, disposition, options, ea_buffer, ea_length );
+     file_call_end( FILE_CALL_CREATE, 0, &begin );
++    ps5_log_query_mismatch( "NtCreateFile", 0, options, status, io );
+     return status;
+ }
+ 
+@@ -9106,6 +9137,7 @@
+     file_call_begin( &begin );
+     status = real_NtOpenFile( handle, access, attr, io, sharing, options );
+     file_call_end( FILE_CALL_OPEN, 0, &begin );
++    ps5_log_query_mismatch( "NtOpenFile", 0, options, status, io );
+     return status;
+ }
+ 
+--- a/server/fd.c
+
++++ b/server/fd.c
+
+@@ -2028,13 +2028,22 @@
+     fd->user   = user;
+ }
+ 
++#ifdef __PROSPERO__
++#include "pw_wine_file_query.h"
++#endif
+ /* resolve a path into memory the server's own allocator owns; realpath with
+- * a NULL buffer allocates inside the C library instead */
++ * a NULL buffer allocates inside the C library instead. On the PS5 realpath
++ * can fail after stat succeeded; the normalised path is kept so unix_name
++ * is not NULL. */
+ static char *realpath_dup( const char *path )
+ {
++#ifdef __PROSPERO__
++    return pw_file_query_unix_name( path );
++#else
+     char resolved[PATH_MAX];
+ 
+     return realpath( path, resolved ) ? strdup( resolved ) : NULL;
++#endif
+ }
+ 
+ char *dup_fd_name( struct fd *root, const char *name )
+@@ -2092,6 +2101,21 @@
+ 
+ #ifdef __PROSPERO__
+ #include "pw_wine_file_query.h"
++#include "pw_wine_fdv.h"
++
++/* Logging only. One line per mismatch, 20 per client pid in this module. */
++static void ps5_note_file_mismatch( struct fd *fd, const char *call, unsigned int class, unsigned int options )
++{
++    char line[192];
++    int type = -1;
++    unsigned long pid = current ? (unsigned long)current->unix_pid : 0;
++
++    if (fd && fd->fd_ops && fd->fd_ops->get_fd_type)
++        type = fd->fd_ops->get_fd_type( fd );
++    if (!pw_file_query_note_mismatch( pid, call, class, options, type, line, sizeof(line) )) return;
++    fputs( line, stderr );
++    fflush( stderr );
++}
+ #endif
+ /* open() wrapper that returns a struct fd with no fd user set */
+ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
+@@ -2180,7 +2204,14 @@
+      * and get_handle_unix_name, set_fd_name, set_fd_disposition, file_open_file and an open by file id then
+      * return STATUS_OBJECT_TYPE_MISMATCH. The path is the file stock Wine statted. A real socket, fifo or
+      * device, whose path is not a file or a directory, stays a special file. */
+-    if (fstat( fd->unix_fd, &st )) memset( &st, 0, sizeof(st) );
++    {
++        uint32_t pin = 0;
++
++        /* The placeholder must not be what this fstat classifies. A real socket is not tracked. */
++        pw_file_query_pin( fd->unix_fd, pw_wine_fdv && pw_wine_fdv->enter ? pw_wine_fdv->enter : NULL, &pin );
++        if (fstat( fd->unix_fd, &st )) memset( &st, 0, sizeof(st) );
++        pw_file_query_unpin( pin, pw_wine_fdv ? pw_wine_fdv->leave : NULL );
++    }
+     if (pw_file_query_kind( st.st_mode, 0 ) == PW_FILE_QUERY_SPECIAL)
+     {
+         char *opened = dup_fd_name( root, name );
+@@ -2903,7 +2934,13 @@
+             info->Length = len;
+             memcpy( info->Name, fd->unix_name, data_len - sizeof(*info) );
+         }
+-        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
++        else
++        {
++#ifdef __PROSPERO__
++            ps5_note_file_mismatch( fd, "WineFileUnixNameInformation", info_class, 0 );
++#endif
++            set_error( STATUS_OBJECT_TYPE_MISMATCH );
++        }
+         break;
+     default:
+         set_error( STATUS_NOT_IMPLEMENTED );
+@@ -2970,6 +3007,9 @@
+ 
+     if (!fd->inode)
+     {
++#ifdef __PROSPERO__
++        ps5_note_file_mismatch( fd, "set_fd_disposition", 0, 0 );
++#endif
+         set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         return;
+     }
+@@ -3045,6 +3085,9 @@
+ 
+     if (!fd->inode || !fd->unix_name)
+     {
++#ifdef __PROSPERO__
++        ps5_note_file_mismatch( fd, "set_fd_name", 0, 0 );
++#endif
+         set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         return;
+     }
+@@ -3181,6 +3224,9 @@
+ 
+     if (!fd->inode)
+     {
++#ifdef __PROSPERO__
++        ps5_note_file_mismatch( fd, "set_fd_eof", 0, 0 );
++#endif
+         set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         return;
+     }
+@@ -3304,7 +3350,13 @@
+             if (name_len <= get_reply_max_size()) set_reply_data( fd->unix_name, name_len );
+             else set_error( STATUS_BUFFER_OVERFLOW );
+         }
+-        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
++        else
++        {
++#ifdef __PROSPERO__
++            ps5_note_file_mismatch( fd, "get_handle_unix_name", 0, 0 );
++#endif
++            set_error( STATUS_OBJECT_TYPE_MISMATCH );
++        }
+         release_object( fd );
+     }
+ }
+--- a/server/file.c
+
++++ b/server/file.c
+
+@@ -156,19 +156,56 @@
+     default_fd_reselect_async     /* reselect_async */
+ };
+ 
++#ifdef __PROSPERO__
++#include "pw_wine_file_query.h"
++#include "pw_wine_fdv.h"
++
++static void ps5_pin_fd( int fd, uint32_t *pin )
++{
++    pw_file_query_pin( fd, pw_wine_fdv && pw_wine_fdv->enter ? pw_wine_fdv->enter : NULL, pin );
++}
++
++static void ps5_unpin_fd( uint32_t pin )
++{
++    pw_file_query_unpin( pin, pw_wine_fdv ? pw_wine_fdv->leave : NULL );
++}
++
++static void ps5_note_file_mismatch( const char *call, unsigned int class, unsigned int options, int type )
++{
++    char line[192];
++    unsigned long pid = current ? (unsigned long)current->unix_pid : 0;
++
++    if (!pw_file_query_note_mismatch( pid, call, class, options, type, line, sizeof(line) )) return;
++    fputs( line, stderr );
++    fflush( stderr );
++}
++#endif
++
+ /* create a file from a file descriptor */
+ /* if the function fails the fd is closed */
+ struct file *create_file_for_fd( int fd, unsigned int access, unsigned int sharing )
+ {
+     struct file *file;
+     struct stat st;
++#ifdef __PROSPERO__
++    uint32_t pin = 0;
++
++    /* alloc_file_handle has no unix name. Pin before fstat so a parked file is not a socket. */
++    ps5_pin_fd( fd, &pin );
++#endif
+ 
+     if (fstat( fd, &st ) == -1)
+     {
++#ifdef __PROSPERO__
++        ps5_unpin_fd( pin );
++#endif
+         file_set_error();
+         close( fd );
+         return NULL;
+     }
++#ifdef __PROSPERO__
++    ps5_unpin_fd( pin );
++#endif
+ 
+     if (!(file = alloc_object( &file_ops )))
+     {
+@@ -176,7 +213,11 @@
+         return NULL;
+     }
+ 
++#ifdef __PROSPERO__
++    file->mode = pw_file_query_stored_mode( st.st_mode, 0 );
++#else
+     file->mode = st.st_mode;
++#endif
+     file->access = default_map_access( &file->obj, access );
+     list_init( &file->kernel_object );
+     if (!(file->fd = create_anonymous_fd( &file_fd_ops, fd, &file->obj,
+@@ -194,16 +235,41 @@
+ {
+     struct file *file;
+     struct stat st;
++#ifdef __PROSPERO__
++    int unix_fd = get_unix_fd( fd );
++    uint32_t pin = 0;
++    mode_t path_mode = 0;
+ 
++    /* get_view_file. Pin so a parked module is classified from the real file, not the placeholder. */
++    ps5_pin_fd( unix_fd, &pin );
++    if (fstat( unix_fd, &st ) == -1)
++    {
++        ps5_unpin_fd( pin );
++        file_set_error();
++        return NULL;
++    }
++    ps5_unpin_fd( pin );
++    {
++        const char *opened = get_fd_unix_name( fd );
++        struct stat path_st;
++
++        if (opened && !stat( opened, &path_st )) path_mode = path_st.st_mode;
++    }
++#else
+     if (fstat( get_unix_fd(fd), &st ) == -1)
+     {
+         file_set_error();
+         return NULL;
+     }
++#endif
+ 
+     if ((file = alloc_object( &file_ops )))
+     {
++#ifdef __PROSPERO__
++        file->mode = pw_file_query_stored_mode( st.st_mode, path_mode );
++#else
+         file->mode = st.st_mode;
++#endif
+         file->access = default_map_access( &file->obj, access );
+         list_init( &file->kernel_object );
+         if (!(file->fd = dup_fd_object( fd, access, sharing, FILE_SYNCHRONOUS_IO_NONALERT )))
+@@ -872,7 +938,13 @@
+                                 sharing, FILE_OPEN, options, 0, NULL );
+         free( unix_name );
+     }
+-    else set_error( STATUS_OBJECT_TYPE_MISMATCH );
++    else
++    {
++#ifdef __PROSPERO__
++        ps5_note_file_mismatch( "file_open_file", 0, 0, file_get_fd_type( file->fd ) );
++#endif
++        set_error( STATUS_OBJECT_TYPE_MISMATCH );
++    }
+     return new_file;
+ }
+ 
