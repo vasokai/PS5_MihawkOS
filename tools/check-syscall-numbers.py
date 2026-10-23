@@ -3,9 +3,12 @@
 """Check a built ntdll (and, if given, win32u) against Windows 10 build 19045 syscall numbers.
 
 Wine on this tree reports 10.0.19045 (Windows 10 22H2). On x64 that build, and on 21H2 / 19044,
-syscall 0xe9 is NtFlushInstructionCache. The pinned Wine numbers syscalls densely from 0, so 0xe9
-is NtSetIoCompletion and NtFlushInstructionCache is 0x93. A guest that issues Windows numbers
-therefore enters the wrong function.
+syscall 0xe9 is NtFlushInstructionCache and NtSetIoCompletion is 0x1a3. The generated x64 table
+matches that, with two pins: NtSetIoCompletion stays 0xe9, Forever's hole-filled id, because the
+WoW loader enters its pop-rsp probe when the export immediate is 0x1a3. NtFlushInstructionCache
+moves to 0x1da, past the Windows table, and 0x1a3 is left empty. Every other implemented name
+keeps its 19045 number. A guest that issues the Windows number 0xe9 enters NtSetIoCompletion;
+a guest that issues 0x1a3 gets an empty slot.
 
 The Windows tables are j00ru's, fetched 2026-10-23, stored beside this script. Nothing is
 downloaded at check time.
@@ -92,17 +95,43 @@ def parse_ntsyscalls(text):
     return found
 
 
+# WoW Classic's loader enters the pop-rsp probe when the NtSetIoCompletion export
+# immediate is the 19045 number 0x1a3. Forever's hole-fill leaves that export at
+# 0xe9. NtFlushInstructionCache, which 19045 puts at 0xe9, moves past the table.
+NTDLL_PIN = {
+    'NtSetIoCompletion': 0xe9,
+    'NtFlushInstructionCache': 0x1da,
+}
+NTDLL_PIN_EMPTY = 0x1a3
+
+
+def ntdll_pins(table):
+    if table.get('file') == 'nt64.csv':
+        return NTDLL_PIN
+    return {}
+
+
 def check_entries(entries, table):
     """entries is (id, name) in dispatcher order. Returns a list of error strings."""
     errors = []
     seen = {}
     windows = table['syscalls']
     by_id = table['by_id']
-    matched = wine_only = 0
+    pins = ntdll_pins(table)
+    matched = wine_only = pinned = 0
     for number, name in entries:
         if number in seen:
             errors.append(f'duplicate id {number:#x}: {seen[number]} and {name}')
         seen[number] = name
+        if name in pins:
+            want = pins[name]
+            if number != want:
+                errors.append(
+                    f'{name} stub/slot {number:#x}, pinned {want:#x} '
+                    f'(Windows {table["build"]} {table["arch"]} {windows[name]:#x})')
+            else:
+                pinned += 1
+            continue
         if name in windows:
             want = windows[name]
             if number != want:
@@ -115,12 +144,21 @@ def check_entries(entries, table):
                 errors.append(f'Wine-only {name} occupies Windows id {number:#x} ({by_id[number]})')
             if number >= 0x1000 and table['arch'] != 'win32k':
                 errors.append(f'{name} id {number:#x} collides with the win32u table bit (bit 12)')
+    if pins:
+        owner = seen.get(NTDLL_PIN_EMPTY)
+        if owner:
+            errors.append(f'{NTDLL_PIN_EMPTY:#x} is {owner}; that Windows NtSetIoCompletion immediate stays empty')
+        if len(entries) > 200:
+            for name in pins:
+                if name not in seen.values():
+                    errors.append(f'{name} missing; pinned id is {pins[name]:#x}')
     # A Windows function Wine implements under some other number was already reported.
     # A Windows id with no entry is a hole. Holes must not be some other function; the
     # duplicate/occupation checks above cover that. Count them for the summary.
     holes = [number for number in by_id if number not in seen]
     return errors, {
         'matched': matched,
+        'pinned': pinned,
         'wine_only': wine_only,
         'entries': len(entries),
         'windows': len(windows),
@@ -441,7 +479,8 @@ def dispatcher_entries(elf):
 
 
 def report(title, errors, summary):
-    print(f'{title}: {summary["matched"]} match Windows, {summary["entries"]} entries, '
+    pinned = f', {summary["pinned"]} pinned' if summary.get('pinned') else ''
+    print(f'{title}: {summary["matched"]} match Windows{pinned}, {summary["entries"]} entries, '
           f'{summary["wine_only"]} Wine-only, {summary["holes"]} Windows holes, max id {summary["max_id"]:#x}')
     for error in errors:
         print(f'  {error}')
@@ -678,27 +717,36 @@ def self_test():
     if x86['syscalls']['NtFlushInstructionCache'] == flush:
         print('self-test: x86 and x64 NtFlushInstructionCache unexpectedly match')
         return False
+    pinned_flush = NTDLL_PIN['NtFlushInstructionCache']
+    pinned_completion = NTDLL_PIN['NtSetIoCompletion']
     header = (
         '/* test */\n#define ALL_SYSCALLS32 \\\n    SYSCALL_ENTRY( 0x0008, NtWriteFile, 36 )\n'
         '#ifdef _WIN64\n#define ALL_SYSCALLS \\\n'
-        f'    SYSCALL_ENTRY( {flush:#06x}, NtFlushInstructionCache, 24 ) \\\n'
-        f'    SYSCALL_ENTRY( {completion:#06x}, NtSetIoCompletion, 40 )\n'
+        f'    SYSCALL_ENTRY( {pinned_completion:#06x}, NtSetIoCompletion, 40 ) \\\n'
+        f'    SYSCALL_ENTRY( {pinned_flush:#06x}, NtFlushInstructionCache, 24 )\n'
         '#else\n#define ALL_SYSCALLS ALL_SYSCALLS32\n#endif\n'
     )
     entries = parse_ntsyscalls(header)
     errors, _summary = check_entries(entries, table)
     if errors:
-        print('self-test: a correct header failed:', errors)
+        print('self-test: the pinned header failed:', errors)
         return False
-    bad = header.replace(f'{flush:#06x}, NtFlushInstructionCache', f'{flush:#06x}, NtSetIoCompletion')
-    bad_entries = parse_ntsyscalls(bad)
-    bad_errors, _summary = check_entries(bad_entries, table)
-    if not bad_errors:
-        print('self-test: a header that puts NtSetIoCompletion at 0xe9 was accepted')
+    windows_header = (
+        '/* test */\n#ifdef _WIN64\n#define ALL_SYSCALLS \\\n'
+        f'    SYSCALL_ENTRY( {flush:#06x}, NtFlushInstructionCache, 24 ) \\\n'
+        f'    SYSCALL_ENTRY( {completion:#06x}, NtSetIoCompletion, 40 )\n'
+        '#else\n#define ALL_SYSCALLS ALL_SYSCALLS32\n#endif\n'
+    )
+    windows_errors, _summary = check_entries(parse_ntsyscalls(windows_header), table)
+    if not any('NtSetIoCompletion' in error and f'{completion:#x}' in error for error in windows_errors):
+        print('self-test: Windows 0x1a3 for NtSetIoCompletion was accepted', windows_errors)
+        return False
+    if not any('NtFlushInstructionCache' in error for error in windows_errors):
+        print('self-test: NtFlushInstructionCache at 0xe9 was accepted', windows_errors)
         return False
 
     pe = build_pe64(
-        {'NtFlushInstructionCache': flush, 'NtSetIoCompletion': completion},
+        {'NtFlushInstructionCache': pinned_flush, 'NtSetIoCompletion': pinned_completion},
         {'ZwFlushInstructionCache': 'NTDLL.NtFlushInstructionCache'},
     )
     image = PeImage(pe)
@@ -707,32 +755,44 @@ def self_test():
         print('self-test pe:', pe_errors)
         return False
     got = {name: number for number, name in pe_entries}
-    if got.get('NtFlushInstructionCache') != flush or got.get('NtSetIoCompletion') != completion:
+    if got.get('NtFlushInstructionCache') != pinned_flush or got.get('NtSetIoCompletion') != pinned_completion:
         print('self-test pe parsed', got)
         return False
     pe_check, _summary = check_entries(pe_entries, table)
     if pe_check:
-        print('self-test: correct PE failed', pe_check)
+        print('self-test: pinned PE failed', pe_check)
+        return False
+    windows_pe = build_pe64(
+        {'NtFlushInstructionCache': flush, 'NtSetIoCompletion': completion},
+        {},
+    )
+    windows_pe_errors, _summary = check_entries(pe_syscall_entries(PeImage(windows_pe))[1], table)
+    if not windows_pe_errors:
+        print('self-test: a PE with the Windows 0x1a3 immediate was accepted')
         return False
 
-    elf = build_elf_dispatch({flush: 'NtFlushInstructionCache', completion: 'NtSetIoCompletion'})
+    elf = build_elf_dispatch({pinned_completion: 'NtSetIoCompletion', pinned_flush: 'NtFlushInstructionCache'})
     parsed = ElfImage(elf)
     limit, slots = parsed.dispatch_slots()
-    if limit < completion or slots[flush] != 'NtFlushInstructionCache' or slots[completion] != 'NtSetIoCompletion':
-        print(f'self-test elf limit {limit:#x} flush {slots[flush] if limit > flush else None} '
-              f'completion {slots[completion] if limit > completion else None}')
+    if (limit < pinned_flush or slots[pinned_completion] != 'NtSetIoCompletion'
+            or slots[pinned_flush] != 'NtFlushInstructionCache' or slots[completion] is not None):
+        print(f'self-test elf limit {limit:#x} completion {slots[pinned_completion] if limit > pinned_completion else None} '
+              f'flush {slots[pinned_flush] if limit > pinned_flush else None} '
+              f'windows slot {slots[completion] if limit > completion else None}')
         return False
     if slots[0] is not None:
         print('self-test: hole 0 is', slots[0])
         return False
-    wrong = build_elf_dispatch({flush: 'NtSetIoCompletion', completion: 'NtSetIoCompletion'})
+    wrong = build_elf_dispatch({flush: 'NtFlushInstructionCache', completion: 'NtSetIoCompletion'})
     wrong_slots = dispatcher_entries(ElfImage(wrong))
     wrong_errors, _summary = check_entries(wrong_slots, table)
-    if not any('NtSetIoCompletion' in error and f'{flush:#x}' in error for error in wrong_errors):
-        print('self-test: dispatcher mapping 0xe9 to NtSetIoCompletion was accepted', wrong_errors)
+    if not any('NtSetIoCompletion' in error and f'{completion:#x}' in error for error in wrong_errors):
+        print('self-test: dispatcher mapping 0x1a3 to NtSetIoCompletion was accepted', wrong_errors)
         return False
     print(f'self-test: Windows {table["build"]} {table["arch"]} NtFlushInstructionCache={flush:#x} '
-          f'NtSetIoCompletion={completion:#x}; PE stub, Zw forwarder, ELF reloc table and the bad mapping all checked')
+          f'NtSetIoCompletion={completion:#x}; pinned NtSetIoCompletion={pinned_completion:#x} '
+          f'NtFlushInstructionCache={pinned_flush:#x}; PE stub, Zw forwarder, ELF reloc table and the '
+          f'Windows immediate all checked')
     return True
 
 

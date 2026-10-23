@@ -1,0 +1,46 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: pin NtSetIoCompletion to 0xe9
+
+WoW Classic's loader enters the pop-rsp probe when the
+NtSetIoCompletion export's mov eax immediate is the Windows 10
+build 19045 id 0x1a3. Forever's hole-fill, and the pre-1246
+console, leave that immediate at 0xe9. Those calls returned.
+NtFlushInstructionCache takes the next free id, 0x1da, and 0x1a3
+stays empty. The 32-bit list is unchanged. No console run.
+---
+diff --git a/tools/make_specfiles b/tools/make_specfiles
+--- a/tools/make_specfiles
++++ b/tools/make_specfiles
+@@ -451,6 +451,32 @@
+         $used{$id} = $name;
+         $syscall->[2] = $id;
+     }
++
++    # WoW Classic reads the mov eax immediate of the NtSetIoCompletion export.
++    # 0x1a3 is the Windows 10 19045 number, and that immediate is what sends
++    # the loader into the pop-rsp probe (ntdll+0x58340 in the 19045 image,
++    # wine-child 151). Forever's hole-fill, with this assignment not applied,
++    # leaves that export at 0xe9. The pre-1246 console log used 0xe9 and the
++    # calls returned without that probe. Pin the export back to 0xe9.
++    # NtFlushInstructionCache holds 0xe9 in the Windows table, so it takes the
++    # next free id. 0x1a3 stays empty: no stub carries the Windows immediate.
++    my ($completion, $flush);
++    foreach my $syscall (@$syscalls)
++    {
++        $completion = $syscall if $syscall->[0] eq 'NtSetIoCompletion';
++        $flush = $syscall if $syscall->[0] eq 'NtFlushInstructionCache';
++    }
++    die "NtSetIoCompletion missing from the 64-bit list\n" unless $completion;
++    die "NtFlushInstructionCache missing from the 64-bit list\n" unless $flush;
++    die "19045 NtSetIoCompletion id changed\n" if $completion->[2] != 0x1a3;
++    die "19045 NtFlushInstructionCache id changed\n" if $flush->[2] != 0xe9;
++    die "no free id for NtFlushInstructionCache\n" if $next >= 0x1000 || $used{$next};
++    delete $used{$flush->[2]};
++    $flush->[2] = $next;
++    $used{$next} = $flush->[0];
++    delete $used{$completion->[2]};
++    $completion->[2] = 0xe9;
++    $used{0xe9} = $completion->[0];
+ }
+ 
+ sub update_syscalls($$$$;$)
