@@ -1,5 +1,22 @@
 # Plan
 
+## Non-JIT data still on the system pool (2026-10-22, no console run)
+
+Sharing JIT code objects does not shrink the system pool: the kernel charges a shared object in full in every process that maps it (a launcher session's helper census went from 1532 to 1568 MiB). Executable pages cannot take direct memory. The movable charge is the non-JIT part of each helper's `sceKernelGetResidentFmemCount`.
+
+From [gate-std-2026-10-21-01](../evidence/gate-std-2026-10-21-01-mihawk-browser.json) (standard PS5, MihawkBrowser, `about:blank`; fmem is the truncated MiB peak, JIT is `converted_kib`):
+
+| Process | System pool | JIT | Non-JIT |
+| --- | --- | --- | --- |
+| browser | 144 MiB | 63,552 KiB (62.06 MiB) | 83,904 KiB (81.94 MiB) |
+| renderer | 68 MiB | 34,960 KiB (34.14 MiB) | 34,672 KiB (33.86 MiB) |
+| utility `storage.mojom.StorageService` | 45 MiB | 12,576 KiB (12.28 MiB) | 33,504 KiB (32.72 MiB) |
+| utility `chrome.mojom.ProcessorMetrics` | no census line (it had exited) | 11,632 KiB | — |
+
+The three processes that printed both figures held **152,080 KiB (148.52 MiB)** of system-pool charge that is not a JIT copy. That is the upper bound on what moving data can take off the pool. The walk's flexible resident was below the JIT copy for the browser (54 MiB) and the renderer (27 MiB), so those two records do not separate mappings from kernel structures. The storage helper's walk (27 MiB) is above its JIT copy, so about 15 MiB was walk-visible non-JIT and 18 MiB of its kernel charge was in no mapping the walk listed. Battle.net's 13 helpers are not in this record.
+
+Anonymous sections above one host page, except the wineserver's session mapping (1,327,104 bytes at Wine `1c785966`), now register for direct memory, and a helper maps a registered section from that RAM instead of the shm file. User shared data (one 16 KiB page) and the session stay on the file the server writes. Host tests `pw_wine_dsection`, `pw_wine_dmem_ps5`, `pw_wine_section_dmem`. Not run on a console.
+
 ## Flexible pressure and anonymous direct memory (2026-10-22, no console run)
 
 A firmware 12.20 title log showed the resident census (the guard's old input) climb from 944 MiB to 1601 MiB in about

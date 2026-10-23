@@ -29,6 +29,10 @@ def main():
  run([sdk/'bin/prospero-clang','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-fPIC','-c',ROOT/'wine/ps5/pw_wine_process.c','-o',obj])
  dmem_obj=prx/'pw_wine_dmem_ps5.o'
  run([sdk/'bin/prospero-clang','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-fPIC','-c',ROOT/'wine/ps5/pw_wine_dmem_ps5.c','-o',dmem_obj])
+ dsection_obj=prx/'pw_wine_dsection.o'
+ dmap_obj=prx/'pw_wine_dmap.o'
+ run([sdk/'bin/prospero-clang','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-fPIC','-c',ROOT/'wine/ps5/pw_wine_dsection.c','-o',dsection_obj])
+ run([sdk/'bin/prospero-clang','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-fPIC','-c',ROOT/'wine/ps5/pw_wine_dmap.c','-o',dmap_obj])
  exports=re.findall(r'extern char ([a-zA-Z0-9_]+)\[\];',(base/'prx/obj/ntdll_desc.c').read_text())
  for name in ('__wine_ps5_set_payload_memory','__wine_ps5_set_payload_low_image','__wine_ps5_set_payload_module','__wine_ps5_set_payload_sigaction','__wine_ps5_exec_stats','__wine_ps5_foreign_stats','__wine_ps5_exec_convert','__wine_ps5_host_allows','__wine_ps5_exec_refused'):
   if name not in exports:exports.append(name)
@@ -43,6 +47,10 @@ def main():
  objects += [dmem_obj if n=='pw_wine_dmem_ps5' else base/'heap'/f'{n}.o' for n in ('pw_wine_heap','pw_wine_heap_libc','pw_wine_dmem','pw_wine_dmem_ps5','pw_wine_section','pw_wine_section_ps5','pw_wine_alias','pw_wine_mmu4k','pw_wine_mmu4k_slot','pw_wine_mmu4k_ps5','pw_ia32_isa','pw_ia32_decode')]
  names=('pw_ntsync','pw_wine_ntsync','pw_wine_process','pw_wine_process_io','pw_wine_threads','pw_wine_prx','pw_wine_dl','pw_wine_dl_libc','pw_wine_compat','pw_wine_compat_libc','pw_wine_sink','pw_audio_ring','pw_memory_helper','pw_memory_service','pw_wine_perf','pw_wine_cwd','pw_wine_cwd_libc','pw_wine_fdv','pw_wine_fdv_libc','ntdll_desc')
  objects += [obj if n=='pw_wine_process' else dl_obj if n=='pw_wine_dl_libc' else desc_obj if n=='ntdll_desc' else base/'prx/obj'/f'{n}.o' for n in names]
+ replaced={'pw_wine_dsection.o':dsection_obj,'pw_wine_dmap.o':dmap_obj}
+ objects=[replaced.get(Path(o).name,o) for o in objects]
+ present={Path(o).name for o in objects}
+ objects += [dest for name,dest in replaced.items() if name not in present]
  wraps=sorted(set(re.findall('__wrap_([a-z_0-9]+)',(ROOT/'wine/ps5/pw_wine_cwd_libc.c').read_text()+(ROOT/'wine/ps5/pw_wine_fdv_libc.c').read_text())))
  stubs=sorted((base/'title-stubs').glob('*.so'))
  command=[sdk/'bin/prospero-lld','--shared','-Bsymbolic','-T',pie,'-T',ROOT/'wine/ps5/prx_eh_frame.ld','--eh-frame-hdr','-soname','ntdll.prx','-z','defs','--warn-unresolved-symbols','-L'+str(base/'ps5lib'),'-o',prx/'ntdll.shared.elf',*objects,*['--wrap='+n for n in wraps],sdk/'target/lib/libps5platform.a',sdk/'target/lib/libunwind.a','--as-needed',*stubs]
@@ -59,7 +67,7 @@ def main():
  run(['python3','-c',audit,base/'build',base/'make.log',out/'report.json',sdk,report['wine_commit'],prx,'0',*report['patches']])
  measured=json.loads((out/'report.json').read_text());entry=measured['prx']['modules']['ntdll']
  if any(entry.get(k) for k in ('unresolved','errors','raw_syscalls','title_unbound')):raise RuntimeError('New runtime import audit failed: '+str(entry))
- inputs=[*objects,*stubs,pie,tool,sdk/'target/lib/libps5platform.a',sdk/'target/lib/libunwind.a',base/'report.json',base/'make.log',ROOT/'tools/build-wine-ps5.sh',ROOT/'wine/ps5/pw_wine_process.c',ROOT/'wine/ps5/pw_payload_spawn.h',ROOT/'wine/ps5/pw_payload_rendezvous.h',ROOT/'wine/ps5/pw_wine_dmem_ps5.c',ROOT/'wine/ps5/pw_wine_dl_libc.c',ROOT/'tools/gen_prx_descriptor.py',base/'prx/obj/ntdll_desc.c',Path(__file__)]
+ inputs=[*objects,*stubs,pie,tool,sdk/'target/lib/libps5platform.a',sdk/'target/lib/libunwind.a',base/'report.json',base/'make.log',ROOT/'tools/build-wine-ps5.sh',ROOT/'wine/ps5/pw_wine_process.c',ROOT/'wine/ps5/pw_payload_spawn.h',ROOT/'wine/ps5/pw_payload_rendezvous.h',ROOT/'wine/ps5/pw_wine_dmem_ps5.c',ROOT/'wine/ps5/pw_wine_dsection.c',ROOT/'wine/ps5/pw_wine_dmap.c',ROOT/'wine/ps5/pw_wine_dl_libc.c',ROOT/'tools/gen_prx_descriptor.py',base/'prx/obj/ntdll_desc.c',Path(__file__)]
  manifest={'base_report_sha256':digest(base/'report.json'),'sdk_revision':(sdk/'.ps5-sdk-revision').read_text().strip(),'inputs':{str(n):digest(n) for n in inputs},'ntdll_sha256':entry['sha256']}
  (out/'payload-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n');print(out)
 if __name__=='__main__':main()

@@ -140,7 +140,9 @@ Sony probes/build tools remain separate from the shipped payload route.
 
 The system-memory guard stays enabled because application backing does not remove
 all system-pool consumption. JIT copies, native modules and some shared transport
-still use flexible memory. The guard's input is the resident census minus
+still use flexible memory. An anonymous section above one host page takes direct
+memory, except the wineserver's session mapping and user shared data, which stay
+on the file the server writes. A shared mapping of any other file stays flexible. The guard's input is the resident census minus
 direct-memory growth since the session's start (`src/pw_memory_policy.h`), so a
 helper that commits the application pool is not, by that growth alone, treated as
 exhausting the flexible pool. Flexible free at or below 96 MiB, or a raw resident

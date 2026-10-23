@@ -94,7 +94,7 @@ static void direct_setup(void)
     pw_wine_dsection_init(&table_ops);
     pw_wine_dsection_release(7, 42);
     (void)pw_wine_dsection_collect(NULL, NULL);
-    assert(!pw_wine_dsection_register(-1, 7, 42, PW_WINE_DSECTION_MIN_BYTES));
+    assert(!pw_wine_dsection_register(-1, 7, 42, 256u << 20));   /* views reach 224 MiB */
     pw_wine_dmap_init(&client_ops);
     if (section_fd < 0) section_fd = memfd_create("section", 0);
     assert(section_fd >= 0);
