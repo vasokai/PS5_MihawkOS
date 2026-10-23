@@ -94,6 +94,7 @@ declare -A sources=(
     [test_pw_fd_census]="src/pw_fd_census.c"
     [test_pw_file_query]=""
     [test_pw_status_note]=""
+    [test_syscall_numbers]=""
     [test_pw_pipe_memory]="src/pw_pipe_memory.c"
     [test_pw_memory_guard]="src/pw_memory_guard.c"
     [test_pw_memory_policy]="src/pw_memory_policy.c"
@@ -173,6 +174,11 @@ for test in "$root"/tests/test_*.c; do
     fi
     if [[ $name == test_pw_dns_unix ]]; then
         python3 "$root/tools/test-dns-backend.py"
+        ran=$((ran + 1))
+        continue
+    fi
+    if [[ $name == test_syscall_numbers ]]; then
+        python3 "$root/tools/check-syscall-numbers.py" --self-test
         ran=$((ran + 1))
         continue
     fi
