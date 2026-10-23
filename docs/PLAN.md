@@ -1,3 +1,45 @@
+## Windows thunk bytes, trapped as int 2e (2026-10-23, no console run)
+
+1256 was built and has not been run on a console. Its hashes are the table in the next section: `ntdll.prx.elf` `860847d4`, `ntdll.prx` `869acc75`, `ntdll.dll` `63b7dab8`. That build left every thunk on `call [0x7ffe1000]`. The loader's store of byte `0x5c` at `ntdll+0x58340` is a write into a thunk whose live bytes are not Windows. Win10 19045's x64 thunk is 32 bytes: `4c 8b d1`, `mov eax, id`, `test byte [0x7ffe0308], 1`, `75 03`, `0f 05`, `c3`, `cd 2e`, `c3`, and the nop `0f 1f 84 00 00 00 00 00`.
+
+1253 executed `0f 05` with a Windows number. Prospero returned to the following `ret`, and `rcx` was that RIP. The number entered the kernel. `KUSER_SHARED_DATA.SystemCall` stays 1, so `jne +3` skips `0f 05`. The trap is `int 2e`, taken only after this process's signal handlers exist. `ps5_arm_ntdll_syscalls` still runs from `load_ntdll` and still logs `path=call`. It leaves the file's `eb 01` and `call [0x7ffe1000]`. If bit 0 of `SystemCall` is clear it stores `value|1`. It does not store 0, and the shared page is not published as 0. That is the window 1255 closed: every thunk, including process startup, executed `int 2e` before a handler existed.
+
+After `wine-ps5: signal-init handlers=ready`, `ps5_enable_windows_thunks` rewrites each executable-section sequence
+
+`f6 04 25 08 03 fe 7f 01 75 03 0f 05 c3 eb 01 c3 ff 14 25 00 10 fe 7f c3`
+
+to
+
+`f6 04 25 08 03 fe 7f 01 75 03 0f 05 c3 cd 2e c3 0f 1f 84 00 00 00 00 00`
+
+`0f 05` stays at `+0x12`. `+0x15` is `cd 2e`. `+0x18` is the Win10 nop. `cpuid` serializes the store. `SystemCall` is kept with bit 0 set. The line is
+
+`wine-ps5: syscall-int2e ntdll armed=%u already=%u failed=%u systemcall=%#x path=int2e trap=cd2e reason=syscall-collides sample=...`
+
+`sample` is the first thunk's 32 bytes. A fresh image has 258 sites.
+
+`int 2e`, and a fault whose RIP is `0f 05`, inside that ntdll and outside a 32-bit code segment, resume at `__wine_syscall_dispatcher_prolog_end`. `frame->rip` is the fault RIP plus 2 plus `0xb`, so the epilogue returns to the stub's `ret`. The entry does not pop a return address. An `rsp` inside a thread stack that is already set stays where the CPU left it. An `rsp` outside that stack is put on the lowest slot that still holds the qword. The prefix `5c 8b d1` at the stub (`rip-0x15` for `cd 2e`, `rip-0x12` for `0f 05`) copies the guest `rcx` into `r10`. A stack that is not set yet is left as delivered. A missing frame, or an outside `rsp` with no slot, logs `syscall-emu skip` and the fault continues as an exception. At most 32 `syscall-emu` lines and 8 skips. A nested entry returns without resuming. SIGSYS uses that same resume when RIP is the stub, or the byte after `0f 05` or `cd 2e`. Any other SIGSYS is set back to `SIG_DFL` and raised (`wine-ps5: sigsys not-stub`). 1253 did not raise SIGSYS.
+
+`cd 29` at the fault RIP, when the trap is not a page fault, raises non-continuable `STATUS_STACK_BUFFER_OVERRUN` (`0xC0000409`). `ExceptionInformation[0]` is `RCX`. `NtRaiseException` is called with search FALSE. The line is `wine-ps5: fastfail int29`, at most 8. A `#GP` whose error code already names vector `0x29` still goes through `handle_interrupt`.
+
+The dispatcher repair from 1256 stays for a thunk that still contains `call [0x7ffe1000]`. It changes `rsp` and `r10` only for that Wine tail. After the rewrite the tail is the nop, so the repair leaves the frame alone and the `int 2e` path owns the entry.
+
+Which path runs: `path=call` is every process from `load_ntdll` until that process logs `handlers=ready` and then `path=int2e`. Ntdll calls in that window, including the ones the shell makes before its handlers exist, execute `call [0x7ffe1000]`. After `path=int2e`, every 64-bit ntdll thunk in that process executes `int 2e`. That is the guest of Mihawk, explorer, service processes, wineserver clients, Battle.net, and WowB. A 32-bit code segment stays on its own dispatcher. The rewrite pattern is the x64 tail, so a 32-bit ntdll is left as loaded. `signal_i386.c` is unchanged.
+
+Syscall numbers stay the 19045 table. The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The compare of protocol `0x3a3` is still the one instruction `81 fe a3 03 00 00` at VA `0x35f70`. `movl $0x3a3, %edx` is still the one instruction `ba a3 03 00 00` at VA `0x36284`. `.text` holds the dword `a3 03 00 00` three times: those two immediates, and the displacement of a `je` at VA `0x916f3` (`0f 84 a3 03 00 00`). That `je` was at `0x90e63` in the 1256 image. There is no compare of `0x3a2`. The whole file holds the dword 42 times, in the same sections as 1256: `.text` 3, `.debug_loc` 18, `.debug_info` 13, `.debug_ranges` 4, `.debug_aranges` 1, `.debug_line` 1, `.dynsym` 1, `.symtab` 1. The PE image was not rebuilt: `SizeOfImage` stays `0x2d5000`, the file stays 3,211,264 bytes, hash `63b7dab8`. wineserver was not rebuilt. The 32-bit ntdll and wow64 were not rebuilt. `file.o` is the object the 1256 link already used.
+
+This build was not run on a console. Mihawk's startup is not claimed back, and the return to Play is not claimed gone. The next pull's `syscall-boot`, `syscall-arm` with `path=call`, `signal-init handlers=ready`, and `syscall-int2e` with `path=int2e` and `systemcall` bit 0 set are what show the order. A `syscall-emu` line is an `int 2e`, or a faulting `0f 05`, that resumed. A `fastfail int29` line is `__fastfail`.
+
+Install the new unix files with the `63b7dab8` `ntdll.dll`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `63b7dab8c8e872cb375a0d051c5b8eb97ec744e88f31a0ea229c1f6e7f1bd3e4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,438,628 | `a094f685808576a6f6f835248ad470059bed47268e06c45146d3dcddc9ccd4fb` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,229,410 | `a56da7ff9c49d7891e5584f9809318a43259b797d1893b6ebc9187953149ddf3` |
+
+The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,921,976 bytes, `4e833216b9e501b731e64744d3821df5af40e6bce64feb4d0c49bcbe4ec1bfc1`.
+
 ## Keep call [0x7ffe1000] and repair a rewritten stub (2026-10-23, no console run)
 
 1255 was installed and the hashes match the table in the next section: `ntdll.prx.elf` `a586cf87`, `ntdll.prx` `8ce100e8`, `ntdll.dll` `63b7dab8`. Mihawk itself then stayed on a black screen, before WoW and Battle.net. A log pull returned nothing. `ps5_arm_ntdll_syscalls` had stored `KUSER_SHARED_DATA.SystemCall` as 0 after rewriting every thunk to `cd 2e`, so every ntdll syscall, including process startup and the shell, executed `int 2e`.

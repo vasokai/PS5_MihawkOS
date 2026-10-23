@@ -1,0 +1,447 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: match the Win10 syscall thunk and trap int 2e
+
+Prospero returns from a Windows syscall number, so SystemCall stays 1
+and the file's 0f 05 is not executed. After the signal handlers exist,
+each thunk's tail becomes the Win10 19045 int 2e and nop. The fault
+enters the dispatcher at prolog end without a push. int 0x29 raises
+STATUS_STACK_BUFFER_OVERRUN with the code in RCX. Startup before the
+handlers still uses call [0x7ffe1000]. No console run.
+---
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2281,9 +2281,9 @@
+     free( name );
+     load_ntdll_functions( module );
+ #if defined(__PROSPERO__) && defined(__x86_64__)
+-    /* Count the Win10 thunks and leave their syscall bytes and SystemCall
+-     * bit alone, so startup takes call [0x7ffe1000]. A thunk whose first byte
+-     * the loader rewrote is repaired in the dispatcher, not by int 2e. */
++    /* Count the Win10 thunks and leave call [0x7ffe1000] in place.
++     * signal_init_process rewrites the tail to int 2e after the handlers
++     * exist. SystemCall stays 1: a Windows syscall number enters the kernel. */
+     ps5_arm_ntdll_syscalls( module );
+ #endif
+     if (is_arm64ec()) redirect_ntdll_functions( module );
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -3502,33 +3502,85 @@
+ 
+ 
+ #ifdef __PROSPERO__
+-/* 1255 stored SystemCall as 0 after rewriting every stub to cd 2e. Mihawk
+- * then never reached the shell: every ntdll thunk, including process startup,
+- * took int 2e. This build leaves the file's 0f 05 bytes in place and leaves
+- * KUSER_SHARED_DATA.SystemCall at 1, so jne +3 reaches call [0x7ffe1000].
+- * That is the path Mihawk, explorer and Battle.net already ran.
++/* 1253: Prospero executed the stub's syscall (0f 05) and returned to the
++ * following ret. rcx was that RIP. A Windows number is not SIGSYS; it enters
++ * the kernel. SystemCall therefore stays 1, and 0f 05 is not executed.
+  *
+- * The WowB fault is the one stub whose first byte the loader stored as 0x5c
+- * (pop rsp) at ntdll+0x58340. pop rsp loads the guest return address into rsp
+- * before the flag test. SystemCall is still 1, so the thunk still calls the
+- * dispatcher, and the epilogue returns to the ret at +0x14 with that rsp.
+- * ps5_repair_patched_stub runs only for that entry: rsp is outside the thread
+- * stack, and the bytes at frame->rip-0x14 are a thunk whose first byte is no
+- * longer 4c 8b d1. It puts rsp back on the stack slot that still holds the
+- * popped qword, and it puts the guest rcx into r10 because mov r10, rcx did
+- * not run. An intact thunk never enters that function.
++ * Until the signal handlers exist, the file bytes stay: eb 01 and
++ * call [0x7ffe1000]. That is the path process startup already ran, and it
++ * is why 1255's early int 2e left Mihawk on a black screen.
+  *
+- * syscall and int 2e inside ntdll are still emulated if they fault. Startup
+- * does not execute them. */
++ * After the handlers are installed, the 0x20-byte thunk matches Win10 19045:
++ * 4c 8b d1, mov eax, the shared-user test, 75 03, 0f 05, c3, cd 2e, c3,
++ * and the 8-byte nop 0f 1f 84 00 00 00 00 00. jne +3 lands on int 2e.
++ * The fault enters __wine_syscall_dispatcher at prolog_end. Nothing was
++ * pushed. An rsp already inside the thread stack is left alone, and the
++ * epilogue returns to the ret after int 2e.
++ *
++ * The call-path repair stays for a thunk that still has call [0x7ffe1000]
++ * and a smashed rsp. int 0x29 is __fastfail even when the trap is not
++ * reported as an IDT error: STATUS_STACK_BUFFER_OVERRUN, code in RCX. */
++
++static void *ps5_ntdll_module;
+ 
++/* SizeOfImage is 80 bytes into the NT headers (signature, file header, then
++ * OptionalHeader64 up to that field). A bad header falls through to the name. */
+ static int ps5_pc_in_ntdll( ULONG_PTR pc )
+ {
++    IMAGE_DOS_HEADER dos;
++    DWORD size = 0;
+     char where[80];
+ 
++    if (ps5_ntdll_module &&
++        ps5_read_bytes( ps5_ntdll_module, &dos, sizeof(dos) ) &&
++        dos.e_magic == IMAGE_DOS_SIGNATURE &&
++        dos.e_lfanew >= 0x40 && dos.e_lfanew < 0x1000 &&
++        ps5_read_bytes( (char *)ps5_ntdll_module + dos.e_lfanew + 80, &size, sizeof(size) ) &&
++        size > 0x1000 && size < 0x10000000 &&
++        pc >= (ULONG_PTR)ps5_ntdll_module &&
++        pc - (ULONG_PTR)ps5_ntdll_module < size)
++        return 1;
+     ps5_module_of( pc, where, sizeof(where) );
+     return !strncmp( where, "ntdll.dll+", 10 );
+ }
+ 
++/* cd 29 is __fastfail. Prospero may deliver it as SIGILL rather than a #GP
++ * whose error code names vector 0x29, so the IDT path in handle_interrupt
++ * does not see it. The status is non-continuable and the code is RCX.
++ * A page fault whose bytes happen to be cd 29 is not this. */
++static BOOL ps5_fastfail_int29( ucontext_t *ctx, int signal )
++{
++    BYTE op[2];
++    EXCEPTION_RECORD rec;
++    struct xcontext context;
++    char line[180];
++    static int lines;
++    ULONG_PTR rip;
++
++    if (TRAP_sig(ctx) == TRAP_x86_PAGEFLT) return FALSE;
++    rip = (ULONG_PTR)RIP_sig(ctx);
++    if (!ps5_read_bytes( (void *)rip, op, sizeof(op) )) return FALSE;
++    if (op[0] != 0xcd || op[1] != 0x29) return FALSE;
++    if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) < 8)
++    {
++        snprintf( line, sizeof(line),
++                  "wine-ps5: fastfail int29 rip=%p rcx=%#llx signal=%d trap=%#llx\n",
++                  (void *)rip, (unsigned long long)RCX_sig(ctx), signal,
++                  (unsigned long long)TRAP_sig(ctx) );
++        ps5_log_line( line );
++    }
++    memset( &rec, 0, sizeof(rec) );
++    memset( &context, 0, sizeof(context) );
++    rec.ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
++    rec.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
++    rec.ExceptionAddress = (void *)rip;
++    rec.NumberParameters = 1;
++    save_context( &context, ctx );
++    rec.ExceptionInformation[0] = context.c.Rcx;
++    NtRaiseException( &rec, &context.c, FALSE );
++    return TRUE;
++}
++
+ /* Lowest 8-aligned slot in the thread stack that holds value. 0 when none.
+  * count receives how many matched. The stack is at most 8 MiB. */
+ static ULONG_PTR ps5_find_stack_slot( ULONG_PTR limit, ULONG_PTR base, ULONG_PTR value,
+@@ -3567,34 +3619,48 @@
+     return first;
+ }
+ 
+-/* TRUE when the signal frame now resumes in __wine_syscall_dispatcher. */
++/* TRUE when the signal frame now resumes at prolog_end. int 2e is at +0x15
++ * and syscall is at +0x12. RIP is the faulting instruction: the kernel has
++ * not advanced it. prolog_end subtracts 0xb, so frame->rip is landing+0xb
++ * and the epilogue returns to the stub's ret. RSP is not popped. A stack
++ * range that is not set yet is left as the CPU delivered it. An rsp outside
++ * a stack that is set is the pop rsp case; the qword is still in the stack. */
+ static BOOL ps5_emulate_windows_syscall( ucontext_t *ctx )
+ {
+     extern const void *__wine_syscall_dispatcher_prolog_end_ptr;
+-    struct syscall_frame *frame = get_syscall_frame();
++    struct syscall_frame *frame;
+     BYTE op[2], prefix[3];
+-    ULONG_PTR rip, rsp, limit = 0, base = 0, slot;
++    ULONG_PTR rip, rsp, limit = 0, base = 0, slot, landing, stub_off;
+     unsigned int slots = 0;
+-    int restored = 0;
+-    static int lines, skips;
+-    char line[320];
++    int restored = 0, stack_set, depth;
++    static int lines, skips, emu_depth;
++    char line[360];
+ 
+     rip = (ULONG_PTR)RIP_sig(ctx);
+     if (!ps5_read_bytes( (void *)rip, op, sizeof(op) )) return FALSE;
+     if (!((op[0] == 0x0f && op[1] == 0x05) || (op[0] == 0xcd && op[1] == 0x2e))) return FALSE;
+     if (cs32_sel && CS_sig(ctx) == cs32_sel) return FALSE;
+-    if (!ps5_pc_in_ntdll( rip )) return FALSE;
++    depth = __atomic_fetch_add( &emu_depth, 1, __ATOMIC_RELAXED );
++    if (depth)
++    {
++        __atomic_fetch_sub( &emu_depth, 1, __ATOMIC_RELAXED );
++        return FALSE;
++    }
++    if (!ps5_pc_in_ntdll( rip ))
++    {
++        __atomic_fetch_sub( &emu_depth, 1, __ATOMIC_RELAXED );
++        return FALSE;
++    }
+ 
++    frame = get_syscall_frame();
+     rsp = (ULONG_PTR)RSP_sig(ctx);
+     if (NtCurrentTeb())
+     {
+         limit = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
+         base = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
+     }
+-    /* pop rsp (the 0x5c store at the stub's first byte) leaves RSP holding the
+-     * return address. That qword is still in the thread stack. Put RSP back
+-     * there so the stub's ret has a frame. An intact stub already has RSP. */
+-    if (!(rsp >= limit && rsp < base && !(rsp & 7)))
++    stack_set = base > limit && base - limit <= (8ull << 20);
++    if (stack_set && (rsp < limit || rsp >= base))
+     {
+         slot = ps5_find_stack_slot( limit, base, rsp, &slots );
+         if (!slot)
+@@ -3607,6 +3673,7 @@
+                           (unsigned long long)RCX_sig(ctx) );
+                 ps5_log_line( line );
+             }
++            __atomic_fetch_sub( &emu_depth, 1, __ATOMIC_RELAXED );
+             return FALSE;
+         }
+         rsp = slot;
+@@ -3616,16 +3683,18 @@
+     {
+         if (__atomic_fetch_add( &skips, 1, __ATOMIC_RELAXED ) < 8)
+             ps5_log_line( "wine-ps5: syscall-emu skip why=frame\n" );
++        __atomic_fetch_sub( &emu_depth, 1, __ATOMIC_RELAXED );
+         return FALSE;
+     }
+ 
+     prefix[0] = prefix[1] = prefix[2] = 0;
+-    if (rip >= 0x12) ps5_read_bytes( (void *)(rip - 0x12), prefix, sizeof(prefix) );
++    /* cd 2e is the Windows instruction at +0x15. 0f 05 is at +0x12. */
++    stub_off = (op[0] == 0xcd) ? 0x15 : 0x12;
++    if (rip >= stub_off) ps5_read_bytes( (void *)(rip - stub_off), prefix, sizeof(prefix) );
+     /* 5c 8b d1 is pop rsp; mov edx, ecx. mov r10, rcx did not run. rcx is
+-     * still the first argument, because int 2e has not executed. */
++     * still the first argument. Apply it only once the resume is decided. */
+     if (prefix[0] == 0x5c && prefix[1] == 0x8b && prefix[2] == 0xd1)
+         R10_sig(ctx) = RCX_sig(ctx);
+-
+     if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) < 32)
+     {
+         snprintf( line, sizeof(line),
+@@ -3638,9 +3707,9 @@
+         ps5_log_line( line );
+     }
+ 
+-    /* prolog_end subtracts 0xb from frame->rip. rip+2 is the stub's ret. */
+-    frame->rip = rip + 2 + 0xb;
+-    frame->rcx = rip;
++    landing = rip + 2;
++    frame->rip = landing + 0xb;
++    frame->rcx = landing;
+     frame->eflags = EFL_sig(ctx);
+     frame->restore_flags = 0;
+     if (instrumentation_callback) frame->restore_flags |= RESTORE_FLAGS_INSTRUMENTATION;
+@@ -3653,6 +3722,7 @@
+     }
+     RSP_sig(ctx) = rsp;
+     RIP_sig(ctx) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
++    __atomic_fetch_sub( &emu_depth, 1, __ATOMIC_RELAXED );
+     return TRUE;
+ }
+ 
+@@ -3823,12 +3893,14 @@
+ }
+ 
+ /* Leave the thunks on call [0x7ffe1000]. The line is written before the scan
+- * so a fault in the walk is still named. path=call is every process. */
++ * so a fault in the walk is still named. path=call is this process until
++ * ps5_enable_windows_thunks runs, which is after the signal handlers. */
+ void ps5_arm_ntdll_syscalls( void *module )
+ {
+     unsigned int syscall_sites = 0, int2e_sites = 0, systemcall;
+     char line[160];
+ 
++    ps5_ntdll_module = module;
+     systemcall = user_shared_data ? user_shared_data->SystemCall : 0xffffffff;
+     snprintf( line, sizeof(line), "wine-ps5: syscall-boot systemcall=%#x\n", systemcall );
+     ps5_log_line( line );
+@@ -3845,6 +3917,124 @@
+               syscall_sites, int2e_sites, ps5_keep_system_call() );
+     ps5_log_line( line );
+ }
++
++/* Win10 19045's x64 thunk is 0x20 bytes. The file has eb 01 and
++ * call [0x7ffe1000] where Windows has cd 2e and an 8-byte nop. Rewrite
++ * that tail only. 0f 05 stays, and SystemCall stays 1, so jne +3 executes
++ * int 2e instead of entering the Prospero kernel. */
++static void ps5_enable_windows_thunks(void)
++{
++    static const BYTE wine_tail[24] = {
++        0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01,
++        0x75, 0x03, 0x0f, 0x05, 0xc3, 0xeb, 0x01, 0xc3,
++        0xff, 0x14, 0x25, 0x00, 0x10, 0xfe, 0x7f, 0xc3
++    };
++    static const BYTE win_tail[24] = {
++        0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01,
++        0x75, 0x03, 0x0f, 0x05, 0xc3, 0xcd, 0x2e, 0xc3,
++        0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00
++    };
++    static const BYTE repl[11] = {
++        0xcd, 0x2e, 0xc3, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00
++    };
++    IMAGE_DOS_HEADER *dos = ps5_ntdll_module;
++    IMAGE_NT_HEADERS *nt;
++    IMAGE_SECTION_HEADER *sec;
++    unsigned int i, armed = 0, already = 0, failed = 0;
++    unsigned int eax, ebx, ecx, edx, systemcall, n;
++    ULONG_PTR sample = 0;
++    BYTE shown[32];
++    char hex[72], line[400];
++    const char *sample_text = "-";
++
++    memset( shown, 0, sizeof(shown) );
++    hex[0] = 0;
++    if (dos && dos->e_magic == IMAGE_DOS_SIGNATURE)
++    {
++        nt = (IMAGE_NT_HEADERS *)((char *)dos + dos->e_lfanew);
++        if (nt->Signature == IMAGE_NT_SIGNATURE)
++        {
++            sec = IMAGE_FIRST_SECTION( nt );
++            for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
++            {
++                BYTE *start;
++                SIZE_T size, off;
++                void *addr;
++                ULONG old = 0;
++                int opened = 0;
++
++                if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
++                size = sec[i].Misc.VirtualSize;
++                if (size < 24) continue;
++                start = (BYTE *)dos + sec[i].VirtualAddress;
++                addr = start;
++                if (!NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
++                                             PAGE_EXECUTE_READWRITE, &old ))
++                    opened = 1;
++                for (off = 0; off + 24 <= sec[i].Misc.VirtualSize; )
++                {
++                    BYTE buf[4096];
++                    SIZE_T chunk = sec[i].Misc.VirtualSize - off;
++                    SIZE_T got, j;
++
++                    if (chunk > sizeof(buf)) chunk = sizeof(buf);
++                    got = virtual_uninterrupted_read_memory( start + off, buf, chunk );
++                    if (got < 24) break;
++                    for (j = 0; j + 24 <= got; j++)
++                    {
++                        if (!memcmp( buf + j, win_tail, sizeof(win_tail) ))
++                        {
++                            if (!sample) sample = (ULONG_PTR)(start + off + j) - 8;
++                            already++;
++                            j += 23;
++                            continue;
++                        }
++                        if (memcmp( buf + j, wine_tail, sizeof(wine_tail) )) continue;
++                        if (!opened ||
++                            virtual_uninterrupted_write_memory( start + off + j + 13, repl, sizeof(repl) ))
++                            failed++;
++                        else
++                        {
++                            if (!sample) sample = (ULONG_PTR)(start + off + j) - 8;
++                            armed++;
++                        }
++                        j += 23;
++                    }
++                    off += got - 23;
++                }
++                if (opened)
++                {
++                    ULONG dummy;
++
++                    addr = start;
++                    size = sec[i].Misc.VirtualSize;
++                    NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old, &dummy );
++                }
++            }
++        }
++    }
++    if (armed)
++    {
++        /* x86 NtFlushInstructionCache is a no-op. cpuid serializes, so the
++         * new bytes are what the next guest thunk fetches. */
++        NtFlushInstructionCache( NtCurrentProcess(), ps5_ntdll_module, 0 );
++        __asm__ volatile( "cpuid"
++                          : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
++                          : "a"(0) : "memory" );
++    }
++    if (sample && ps5_read_bytes( (void *)sample, shown, sizeof(shown) ))
++    {
++        for (n = 0; n < sizeof(shown); n++)
++            snprintf( hex + n * 2, (sizeof(hex) - n * 2), "%02x", shown[n] );
++        sample_text = hex;
++    }
++    systemcall = ps5_keep_system_call();
++    snprintf( line, sizeof(line),
++              "wine-ps5: syscall-int2e ntdll armed=%u already=%u failed=%u systemcall=%#x "
++              "path=int2e trap=cd2e reason=syscall-collides sample=%s\n",
++              armed, already, failed, systemcall, sample_text );
++    ps5_log_line( line );
++}
+ #endif
+ 
+ 
+@@ -3864,6 +4054,7 @@
+     if (ps5_mmu4k_signal( signal, siginfo, ucontext )) return;
+     /* UMIP instructions are completed here. The log names any other SIGILL. */
+     if (ps5_try_umip( ucontext, siginfo, signal )) return;
++    if (ps5_fastfail_int29( ucontext, signal )) return;
+     if (ps5_emulate_windows_syscall( ucontext )) return;
+ #endif
+     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
+@@ -3984,6 +4175,7 @@
+         leave_handler( ucontext );
+         return;
+     }
++    if (ps5_fastfail_int29( ucontext, signal )) return;
+     if (ps5_emulate_windows_syscall( ucontext )) return;
+ #endif
+     if (handle_syscall_trap( ucontext, siginfo )) return;
+@@ -4561,6 +4753,34 @@
+     if (!status && old) *old = pw_native_actions[sig];
+     return status;
+ }
++
++/* 1253 returned from a Windows syscall number, so SIGSYS is not the path
++ * those numbers take. A number the kernel does reject lands here. A fault
++ * whose RIP is not an ntdll stub, or the byte after one, keeps SIG_DFL. */
++static void ps5_sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    ucontext_t *ucontext = init_handler( sigcontext );
++    BYTE prev[2];
++    ULONG_PTR rip;
++    struct sigaction dfl;
++
++    (void)siginfo;
++    if (ps5_emulate_windows_syscall( ucontext )) return;
++    rip = (ULONG_PTR)RIP_sig( ucontext );
++    if (rip >= 2 && ps5_read_bytes( (void *)(rip - 2), prev, sizeof(prev) ) &&
++        ((prev[0] == 0x0f && prev[1] == 0x05) || (prev[0] == 0xcd && prev[1] == 0x2e)))
++    {
++        RIP_sig( ucontext ) = rip - 2;
++        if (ps5_emulate_windows_syscall( ucontext )) return;
++        RIP_sig( ucontext ) = rip;
++    }
++    ps5_log_line( "wine-ps5: sigsys not-stub\n" );
++    memset( &dfl, 0, sizeof(dfl) );
++    dfl.sa_handler = SIG_DFL;
++    if (pw_raw_sigaction) pw_raw_sigaction( SIGSYS, &dfl, NULL );
++    else sigaction( SIGSYS, &dfl, NULL );
++    raise( signal );
++}
+ #else
+ # define pw_sigaction sigaction
+ #endif
+@@ -4666,9 +4886,14 @@
+     sig_act.sa_sigaction = sigsys_handler;
+     if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
+ #endif
++#ifdef __PROSPERO__
++    sig_act.sa_sigaction = ps5_sigsys_handler;
++    if (pw_sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
++#endif
+     install_bpf(&sig_act);
+ #ifdef __PROSPERO__
+     ps5_log_line( "wine-ps5: signal-init handlers=ready\n" );
++    ps5_enable_windows_thunks();
+ #endif
+     return;
+ 
