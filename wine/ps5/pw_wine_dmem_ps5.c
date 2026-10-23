@@ -4,8 +4,10 @@
  * virtual memory manager (patch 0600 routes them here), for the address
  * ranges it reserves up front. A private anonymous mapping with no address,
  * once the application allocator is on, is given a direct-memory region of
- * its own (pw_wine_anon_fresh_direct). A fixed address outside a region, and
- * every executable mapping, still passes straight through.
+ * its own (pw_wine_anon_fresh_direct). A shared mapping of an anonymous
+ * section the title registered (pw_wine_dsection.h) is mapped from that
+ * direct memory. A fixed address outside a region, a file the title did not
+ * register, and every executable mapping still pass straight through.
  *
  * The recipe is the one ps5-xash3d's heap runs on (FW 12.02): main direct
  * memory, mapped read-write at a fixed address over a reservation, then
@@ -16,6 +18,7 @@
  * payload's kernel keeps execute only on JIT memory: its executable pages are
  * converted at their first execute (__wine_ps5_exec_convert). */
 #include "pw_wine_alias.h"
+#include "pw_wine_dmap.h"
 #include "pw_wine_dmem.h"
 #include "pw_wine_heap.h"
 #include "pw_wine_pages.h"
@@ -406,6 +409,14 @@ static int state;
 /* shortcut: an adopt that failed after the caller's own mapping replaced runs leaves runs naming memory no longer mapped
  * there; no alias after that (stores step). Upgrade: hold the engine lock across can_adopt and adopt. */
 static int backing_stale;
+/* Non-executable bytes this path placed in direct memory, and the ones it left on a flexible mapping. */
+static uint64_t data_direct_bytes, data_flexible_bytes;
+
+static void note_data(int direct, size_t bytes)
+{
+    if (bytes)
+        __atomic_fetch_add(direct ? &data_direct_bytes : &data_flexible_bytes, (uint64_t)bytes, __ATOMIC_RELAXED);
+}
 
 static uintptr_t page_down(const void *address) { return (uintptr_t)address & ~(uintptr_t)(PAGE - 1); }
 static size_t page_span(const void *address, size_t bytes)
@@ -1040,8 +1051,12 @@ static void *anon_direct_place(size_t bytes, int protection)
     if (reported++ < 4)
         fprintf(stderr, "wine-ps5: private anonymous mapping with no address takes direct memory (%zu bytes at %p)\n",
                 bytes, at);
+    note_data(1, bytes);
     return at;
 }
+
+int __wine_ps5_mprotect(void *address, size_t bytes, int protection);
+int __wine_ps5_munmap(void *address, size_t bytes);
 
 void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, int fd, off_t offset)
 {
@@ -1094,9 +1109,13 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
         if (placed != MAP_FAILED) return placed;
     }
     if (state <= 0 || !(flags & MAP_FIXED) || (uintptr_t)address != at ||
-        (!pw_wine_dmem_split(&dmem, at, end - at, &piece) && piece == end - at))
-        return payload_mmap ? payload_map(address, bytes, protection, flags, fd, offset)
-                            : mmap(address, bytes, protection, flags, fd, offset);
+        (!pw_wine_dmem_split(&dmem, at, end - at, &piece) && piece == end - at)) {
+        void *mapped = payload_mmap ? payload_map(address, bytes, protection, flags, fd, offset)
+                                    : mmap(address, bytes, protection, flags, fd, offset);
+        if (mapped != MAP_FAILED && !(protection & PROT_EXEC) && (protection & 7))
+            note_data(0, page_span(address, bytes));
+        return mapped;
+    }
     if (!(flags & MAP_ANON)) {
         void *mapped;
 
@@ -1108,9 +1127,30 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
             errno = ENODEV;
             return MAP_FAILED;
         }
-        /* Shared memory stays a file mapping, over what is there, as
-         * before direct memory; only the exact address is accepted. */
+        /* Shared memory over what is there; only the exact address is accepted. A section the title keeps in
+         * direct memory is that RAM. Executable mappings stay a file and become JIT at the first execute. A title
+         * that cannot say whether the file is direct fails the mapping: the file here, while another process mapped
+         * the direct memory, would be two copies. */
         if (refuse_foreign(&dmem, at, end)) return MAP_FAILED;
+        if (!(protection & PROT_EXEC) && payload_allocate_direct && fd >= 0) {
+            const int direct = pw_wine_dmap_direct(fd);
+            if (direct > 0) {
+                if (pw_wine_dmap_map(fd, (uintptr_t)address, bytes, (uint64_t)offset)) return MAP_FAILED;
+                /* Adopt before a protection change: a bare reservation would otherwise be backed with a second
+                 * direct-memory run. The map is read-write; a caller that asked for less is narrowed after. */
+                for (; at < end; at += piece)
+                    if (pw_wine_dmem_split(&dmem, at, end - at, &piece) && pw_wine_dmem_adopt(&dmem, at, piece))
+                        __atomic_store_n(&backing_stale, 1, __ATOMIC_RELAXED);
+                if ((protection & 7) != (PROT_READ | PROT_WRITE) &&
+                    __wine_ps5_mprotect(address, bytes, protection)) {
+                    __wine_ps5_munmap(address, bytes);
+                    return MAP_FAILED;
+                }
+                note_data(1, bytes);
+                return address;
+            }
+            if (direct < 0) return MAP_FAILED;
+        }
         mapped = mmap(address, bytes, protection, flags, fd, offset);
         if (mapped == MAP_FAILED) return MAP_FAILED;
         if (mapped != address) {
@@ -1121,6 +1161,7 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
         for (; at < end; at += piece)
             if (pw_wine_dmem_split(&dmem, at, end - at, &piece) && pw_wine_dmem_adopt(&dmem, at, piece))
                 __atomic_store_n(&backing_stale, 1, __ATOMIC_RELAXED);
+        if (!(protection & PROT_EXEC) && (protection & 7)) note_data(0, bytes);
         return address;
     }
     errno = 0;
@@ -1130,7 +1171,10 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
         else if ((payload_mmap ? payload_map((void *)at, piece, protection, flags, -1, 0)
                                : mmap((void *)at, piece, protection, flags, -1, 0)) == MAP_FAILED)
             status = -1;
-    if (!status) return address;
+    if (!status) {
+        if (protection & 7) note_data(1, end - page_down(address));
+        return address;
+    }
     refused_range("mmap", address, bytes, protection);
     /* EEXIST: a foreign entry refused it; map_fixed_area answers STATUS_CONFLICTING_ADDRESSES. */
     if (errno != EEXIST) errno = ENOMEM;
@@ -1221,13 +1265,14 @@ int __wine_ps5_mprotect(void *address, size_t bytes, int protection)
  * at most, its runs and refused calls, the heap's mapped and peak mapped
  * bytes, the direct memory backed below 4 GiB now and at most, then the
  * heap's live bytes, allocations, frees and contended calls, then the last
- * refused call (PW_WINE_DMEM_FAILED_*), its address and bytes. Returns how
- * many counters there are. */
+ * refused call (PW_WINE_DMEM_FAILED_*), its address and bytes, then the
+ * non-executable bytes this path placed in direct memory and the ones it
+ * left on a flexible mapping. Returns how many counters there are. */
 unsigned int __wine_ps5_memory_stats(uint64_t *out, unsigned int count)
 {
     PwWineDmemStats dmem_stats = { 0 };
     PwWineHeapStats heap_stats;
-    uint64_t values[15];
+    uint64_t values[17];
 
     if (state > 0) pw_wine_dmem_stats(&dmem, &dmem_stats);
     pw_wine_heap_stats(&heap_stats);
@@ -1246,8 +1291,10 @@ unsigned int __wine_ps5_memory_stats(uint64_t *out, unsigned int count)
     values[12] = dmem_stats.failed;
     values[13] = dmem_stats.failed_address;
     values[14] = dmem_stats.failed_bytes;
-    for (unsigned int i = 0; i < count && i < 15; i++) out[i] = values[i];
-    return 15;
+    values[15] = __atomic_load_n(&data_direct_bytes, __ATOMIC_RELAXED);
+    values[16] = __atomic_load_n(&data_flexible_bytes, __ATOMIC_RELAXED);
+    for (unsigned int i = 0; i < count && i < 17; i++) out[i] = values[i];
+    return 17;
 }
 
 /* Who holds an engine's lock and for how long (PwWineDmem.holder): out[0] its kernel thread id, 0 when neither

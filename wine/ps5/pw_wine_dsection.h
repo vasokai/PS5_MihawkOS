@@ -36,9 +36,17 @@
 
 enum {
     PW_WINE_DSECTION_CHUNK = 2u << 20,
-    PW_WINE_DSECTION_MIN_BYTES = 256u << 20,   /* the sections the demand pager maps (patch 0962) */
-    PW_WINE_DSECTION_SECTIONS = 64,
-    PW_WINE_DSECTION_PIDS = 16,
+    /* User shared data is one 16 KiB host page, written by the wineserver through its shm fd (patch 0102). Anything
+     * larger is a client section, except the session mapping below, which the server also maps and writes, and grows
+     * without registering again. The demand pager (patch 0962) still faults only sections of 256 MiB and up; a smaller
+     * registered section is mapped whole by __wine_ps5_mmap. */
+    PW_WINE_DSECTION_MIN_BYTES = (16u << 10) + 1,
+    /* create_session_mapping at Wine 1c785966: max(sizeof(session_shm_t) + sizeof(object_shm_t) * 512, 0x10000),
+     * rounded to the 16 KiB host page. 32,744 user entries of 32 bytes is 1,047,808; object_shm_t is 544;
+     * 1,047,808 + 544 * 512 = 1,326,336, which rounds to 1,327,104. */
+    PW_WINE_DSECTION_SESSION_BYTES = 1327104u,
+    PW_WINE_DSECTION_SECTIONS = 256,
+    PW_WINE_DSECTION_PIDS = 32,
     PW_WINE_DSECTION_WAIT_MS = 8000,           /* under a helper pager's 10 s wait for its answer (pw_wine_process.c) */
 };
 
@@ -62,8 +70,8 @@ typedef struct PwWineDsectionOps {
 void pw_wine_dsection_init(const PwWineDsectionOps *ops);
 /* A new anonymous section of size bytes backed by the file fd, whose identity is (dev, ino). fd is duplicated and the
  * copy held until the section's memory goes back; fd stays the caller's (-1: none held, for tests). 0, or -1 with
- * errno EINVAL (too small), EEXIST ((dev, ino) is still in the table), ENOSPC (the table is full), ENOMEM, or dup's
- * error: the section then keeps its file backing. */
+ * errno EINVAL (too small, or the session mapping the server writes itself), EEXIST ((dev, ino) is still in the
+ * table), ENOSPC (the table is full), ENOMEM, or dup's error: the section then keeps its file backing. */
 int pw_wine_dsection_register(int fd, uint64_t dev, uint64_t ino, uint64_t size);
 /* 1 when (dev, ino) is in the table, released or not. */
 int pw_wine_dsection_known(uint64_t dev, uint64_t ino);

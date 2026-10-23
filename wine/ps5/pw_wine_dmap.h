@@ -12,7 +12,9 @@
  * Called by the pager under Wine's virtual mutex (faults included), so there is no lock here. The title and the
  * kernel are reached only through PwWineDmapOps (host-tested: tests/test_pw_wine_section_data.c, PW_SECTION_DMEM). */
 
-enum { PW_WINE_DMAP_FILES = 64, PW_WINE_DMAP_CHUNKS = 32768 };
+/* A full file table fails the mapping (pw_wine_dmap_direct returns -1) rather than falling back to the file: another
+ * process may already have mapped that section's direct memory. */
+enum { PW_WINE_DMAP_FILES = 1024, PW_WINE_DMAP_CHUNKS = 32768 };
 
 typedef struct PwWineDmapOps {
     void *context;

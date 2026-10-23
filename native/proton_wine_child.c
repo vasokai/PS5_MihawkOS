@@ -1137,7 +1137,7 @@ static void *payload_telemetry(void *unused)
             }
         }
         fds_ns = now_ns() - census_begin;
-        char line[384];
+        char line[512];
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         const long long elapsed_ms = (now.tv_sec - census_started.tv_sec) * 1000ll +
@@ -1230,16 +1230,20 @@ static void *payload_telemetry(void *unused)
              * outside, foreign), which the count alone never said (2026-10-07; record removed from the tree). */
             static const char *const refused[] = {"-", "release", "allocate", "map", "protect", "unmap", "reserve",
                                                   "outside", "foreign"};
-            uint64_t counters[15] = {0};
-            const unsigned kept = memory_stats(counters, 15);
+            uint64_t counters[17] = {0};
+            const unsigned kept = memory_stats(counters, 17);
             if (kept >= 12) {
                 const uint64_t what = kept >= 15 ? counters[12] : 0;
+                char placed[80] = "";
+                if (kept >= 17)
+                    snprintf(placed, sizeof(placed), " data_direct=%llu MiB data_flexible=%llu MiB",
+                             (unsigned long long)(counters[15] >> 20), (unsigned long long)(counters[16] >> 20));
                 snprintf(line, sizeof(line), "wine-child: direct memory current=%llu MiB peak=%llu MiB "
-                         "runs=%llu failures=%llu unix_heap=%llu MiB last_failure=%s@%#llx+%#llx\n",
+                         "runs=%llu failures=%llu unix_heap=%llu MiB last_failure=%s@%#llx+%#llx%s\n",
                          (unsigned long long)(counters[0] >> 20), (unsigned long long)(counters[1] >> 20),
                          (unsigned long long)counters[2], (unsigned long long)counters[3],
                          (unsigned long long)(counters[4] >> 20), what < 9 ? refused[what] : "?",
-                         (unsigned long long)counters[13], (unsigned long long)counters[14]);
+                         (unsigned long long)counters[13], (unsigned long long)counters[14], placed);
                 stage(line);
             }
         }
