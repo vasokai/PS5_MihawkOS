@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "pw_prx_elf_ps5.h"
+#include "../src/pw_prx_data.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +16,12 @@ extern int sceKernelJitCreateSharedMemory(const char *name, size_t bytes, int ma
 extern int sceKernelMmap(void *address, size_t bytes, int protection, int flags, int fd, off_t offset, void **out);
 extern int sceKernelMprotect(const void *address, size_t bytes, int protection);
 extern int sceKernelMunmap(void *address, size_t bytes);
+extern int sceKernelAllocateDirectMemoryForApp(int64_t search_start, int64_t search_end, size_t bytes,
+                                               size_t alignment, int type, int64_t *offset);
+extern int64_t sceKernelGetDirectMemorySize(void);
+extern int sceKernelMapDirectMemory(void **address, size_t bytes, int protection, int flags, int64_t offset,
+                                    size_t alignment);
+extern int sceKernelReleaseDirectMemory(int64_t offset, size_t bytes);
 extern int sceKernelDlsym(int handle, const char *name, void **address);
 
 #define PAGE 0x4000u
@@ -114,6 +121,68 @@ static int record_protection(void *opaque, uintptr_t address, size_t bytes, int 
     return 0;
 }
 
+/* Non-executable runs of a user-space .prx.elf are private anonymous flexible memory, one copy per process, and
+ * the resident census counts them. Move each run onto the application pool (src/pw_prx_data.h). Text stays JIT:
+ * execute does not stick on direct memory. WINE_PS5_PRX_DATA_DMEM=0 keeps today's mprotect. */
+#define DMEM_TYPE 0x0c
+#define DMEM_PROT 0x03
+#define DMEM_FIXED 0x10
+
+static int data_allocate(void *context, size_t bytes, uint64_t *offset)
+{
+    int64_t at = 0;
+    (void)context;
+    if (sceKernelAllocateDirectMemoryForApp(0, sceKernelGetDirectMemorySize(), bytes, PAGE, DMEM_TYPE, &at)) return -1;
+    *offset = (uint64_t)at;
+    return 0;
+}
+static int data_map_new(void *context, size_t bytes, uint64_t offset, uintptr_t *where)
+{
+    void *at = NULL;
+    (void)context;
+    if (sceKernelMapDirectMemory(&at, bytes, DMEM_PROT, 0, (int64_t)offset, PAGE) || !at) return -1;
+    *where = (uintptr_t)at;
+    return 0;
+}
+static int data_map_fixed(void *context, uintptr_t address, size_t bytes, uint64_t offset)
+{
+    void *at = (void *)address;
+    (void)context;
+    if (sceKernelMapDirectMemory(&at, bytes, DMEM_PROT, DMEM_FIXED, (int64_t)offset, PAGE) || at != (void *)address)
+        return -1;
+    return 0;
+}
+static int data_map_anon(void *context, uintptr_t address, size_t bytes)
+{
+    void *out = NULL;
+    (void)context;
+    if (sceKernelMmap((void *)address, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0, &out) ||
+        out != (void *)address)
+        return -1;
+    return 0;
+}
+static int data_unmap(void *context, uintptr_t address, size_t bytes)
+{
+    (void)context;
+    return sceKernelMunmap((void *)address, bytes) ? -1 : 0;
+}
+static int data_release(void *context, uint64_t offset, size_t bytes)
+{
+    (void)context;
+    return sceKernelReleaseDirectMemory((int64_t)offset, bytes) ? -1 : 0;
+}
+static int data_protect(void *context, uintptr_t address, size_t bytes, int protection)
+{
+    (void)context;
+    return sceKernelMprotect((void *)address, bytes, protection) ? -1 : 0;
+}
+static void data_copy(void *dst, const void *src, size_t bytes) { memcpy(dst, src, bytes); }
+
+static const PwPrxDataOps data_ops = {
+    NULL, PAGE, data_allocate, data_map_new, data_map_fixed, data_map_anon, data_unmap, data_release, data_protect,
+    data_copy
+};
+
 /* The text is ordinary anonymous memory until here; a payload cannot keep execute on it, so copy it into a JIT
  * object mapped over the range and take RX (the same conversion wine/ps5/pw_wine_dmem_ps5.c measures). */
 static int jit_over(uintptr_t address, size_t bytes)
@@ -140,6 +209,9 @@ static int jit_over(uintptr_t address, size_t bytes)
 static void apply_protections(Loader *loader)
 {
     uintptr_t at = loader->base, end = loader->base + loader->span;
+    size_t direct_bytes = 0, flexible_bytes = 0;
+    const char *skip = getenv("WINE_PS5_PRX_DATA_DMEM");
+    const int move_data = !(skip && skip[0] == '0' && skip[1] == 0);
     while (at < end) {
         int want = 0;
         for (unsigned i = 0; i < loader->prot_count; i++) {
@@ -167,12 +239,26 @@ static void apply_protections(Loader *loader)
         if (want == (PROT_READ | PROT_EXEC)) {
             if (jit_over(at, run_end - at)) fprintf(stderr, "pw_prx_elf: JIT %#lx+%#lx failed errno=%d\n",
                                                     (unsigned long)at, (unsigned long)(run_end - at), errno);
-        } else if (sceKernelMprotect((void *)at, run_end - at, want)) {
-            fprintf(stderr, "pw_prx_elf: protect %#lx+%#lx -> %d failed errno=%d\n",
-                    (unsigned long)at, (unsigned long)(run_end - at), want, errno);
+        } else {
+            int moved = PW_PRX_DATA_KEPT;
+            if (move_data) moved = pw_prx_data_move(&data_ops, at, run_end - at, want);
+            if (moved == PW_PRX_DATA_BROKEN) {
+                fprintf(stderr, "pw_prx_elf: data %#lx+%#lx lost errno=%d\n",
+                        (unsigned long)at, (unsigned long)(run_end - at), errno);
+                loader->failed = 1;
+                return;
+            }
+            if (moved == PW_PRX_DATA_DIRECT) direct_bytes += run_end - at;
+            else {
+                flexible_bytes += run_end - at;
+                if (sceKernelMprotect((void *)at, run_end - at, want))
+                    fprintf(stderr, "pw_prx_elf: protect %#lx+%#lx -> %d failed errno=%d\n",
+                            (unsigned long)at, (unsigned long)(run_end - at), want, errno);
+            }
         }
         at = run_end;
     }
+    fprintf(stderr, "pw_prx_elf: data direct=%zu flexible=%zu bytes\n", direct_bytes, flexible_bytes);
 }
 
 /* The import's middle field is a one-letter token, not a library name: the module's DT_SCE_IMPORT_LIB tags map the
@@ -384,6 +470,7 @@ int pw_prx_elf_ps5_load(const char *path, PwPrxElfImage *image, char *error, siz
         goto fail;
     }
     apply_protections(&loader);
+    if (loader.failed) { status = PW_PRX_ELF_ERR_MAP; goto fail; }
     parse_exports(bytes, (size_t)info.st_size, image->base);
     /* Where the kernel put it: Wine's own tables do not know a mapping this loader makes (late-library on the base PS5). */
     fprintf(stderr, "pw_prx_elf: loaded %s at %#lx+%#lx\n", path, (unsigned long)(loader.base + min), (unsigned long)loader.span);

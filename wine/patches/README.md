@@ -517,3 +517,13 @@ file's times, size and name for `FileBasicInformation`, `FileStandardInformation
 `wine/ps5/pw_wine_file_query.h`, host test `tests/test_pw_file_query.c`. No console run.
 
 Patch 1243 covers three cases patch 1242 left. `realpath` can fail after `stat` succeeded, and `unix_name` was then NULL, so `get_handle_unix_name`, `WineFileUnixNameInformation`, `set_fd_name`, `file_open_file` and the reparse FSCTLs still returned `STATUS_OBJECT_TYPE_MISMATCH`. The normalised path is kept. `NtQueryInformationFile` stopped when `server_get_unix_name` failed, which a `create_file_for_fd` handle always does, so `FileBasicInformation` stayed `STATUS_INVALID_INFO_CLASS` and `FileStandardInformation` described the socket. `get_view_file` stored `file->mode` from the live descriptor, so a parked module was `FD_TYPE_CHAR` and `NtQueryDirectoryFile` returned `STATUS_INVALID_PARAMETER`, a relative open `STATUS_BAD_DEVICE_TYPE`. Those paths pin the descriptor before `fstat`. A real socket, fifo or device is not tracked, so the pin does not change it. A mismatch still returned is one title-log line, at most 20 per process, with the syscall, the info class and the handle type. No console run.
+
+Patch 1250 gives a Chromium browser process the helper budget MihawkBrowser already uses. Each helper copies the
+code it runs into its own JIT memory, and the kernel charges that copy in every process that maps it, so a process
+that is not started is the saving. The switches (`--in-process-gpu`, `--renderer-process-limit`, the network service
+in process, no spare renderer, no out-of-process audio) are written into the command line before `create_startup_info`
+copies it, and the parent's block is put back. An existing `--disable-features`, `--enable-features` or
+`--renderer-process-limit` is left alone. A child (`--type=`) and a program that is not a Chromium host are unchanged.
+`WINE_PS5_CHROMIUM_BUDGET=0` and `WINE_PS5_RENDERER_LIMIT=0` leave the line alone. The spawn cap that refuses a
+renderer past the limit lives in the title's ntdll (`wine/ps5/pw_wine_process.c`), so it is in a relinked
+`ntdll.prx.elf` even when this patch is not yet in the prebuilt objects. No console run.

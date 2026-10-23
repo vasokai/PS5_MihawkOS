@@ -46,6 +46,9 @@ declare -A sources=(
     [test_pw_explorer_layout]=""
     [test_pw_menu_style]=""
     [test_pw_vm_census]="src/pw_vm_census.c"
+    [test_pw_fmem_budget]="src/pw_fmem_budget.c"
+    [test_pw_fmem_census]="src/pw_fmem_census.c src/pw_vm_census.c"
+    [test_pw_prx_data]="src/pw_prx_data.c"
     [test_pw_audio_mix]="src/pw_audio_mix.c"
     [test_pw_audio_ring]="src/pw_audio_ring.c" [test_pw_memory_helper]="src/pw_memory_helper.c" [test_pw_memory_service]="src/pw_memory_service.c"
     [test_pw_wine_dmem_regions]="wine/ps5/pw_wine_dmem.c"
@@ -233,11 +236,15 @@ for test in "$root"/tests/test_*.c; do
         ran=$((ran + 1))
     fi
 done
+if (( $# )) && [[ "$*" == *fmem* ]]; then
+    python3 "$root/tests/test_fmem_breakdown.py"
+    ran=$((ran + 1))
+fi
 if (( $# == 0 )) || [[ "$*" == *console_guard* ]]; then
     for test in console_guard battery_runner shell_capture window_compose_runner appearance_runner profile_report \
             desktop_session_runner desktop_input_runner tls_fixture telemetry_teardown \
             window_material_tokens window_effects_runner frame_pacing_runner deploy_folder console_setup sched_watch run_console_verdicts \
-            placed_unmap_order module_wiring helper_opengl privacy_check dll_overrides prx_exports taskbar_logo stage_licences publication_check title_icon pack_runtime pw_https mihawk_wallpaper mihawk_music browser_lines sign_release package_install check_title_imports carrier_image_probe payload_firmware; do
+            placed_unmap_order module_wiring helper_opengl privacy_check dll_overrides prx_exports taskbar_logo stage_licences publication_check title_icon pack_runtime pw_https mihawk_wallpaper mihawk_music browser_lines sign_release package_install check_title_imports carrier_image_probe payload_firmware fmem_breakdown; do
         python3 "$root/tests/test_$test.py"
         ran=$((ran + 1))
     done

@@ -13,6 +13,7 @@
 #include "../src/pw_gpu_broker.h"
 #include "../src/pw_control_watch.h"
 #include "../src/pw_vm_census.h"
+#include "../src/pw_fmem_census.h"
 #include "../src/pw_helper_sched.h"
 #include "../src/pw_cpu_placement.h"
 #include "../src/pw_log_sessions.h"
@@ -743,6 +744,12 @@ static void vm_census_report(void (*say_line)(const char *))
         char big[512];
         pw_vm_census_format_big(&census, big, sizeof(big));
         snprintf(line, sizeof(line), "wine-child: vm big %s\n", big);
+        say_line(line);
+    }
+    {
+        char classes[1024];
+        pw_fmem_format(&census, classes, sizeof(classes));
+        snprintf(line, sizeof(line), "wine-child: fmem pid=%d %s\n", (int)getpid(), classes);
         say_line(line);
     }
 }

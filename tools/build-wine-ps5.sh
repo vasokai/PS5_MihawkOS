@@ -560,7 +560,9 @@ done
 # The helper spawn's upload (wine/ps5/pw_payload_spawn.h) through the title's one encoder.
 "$sdk/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
     -c "$root/src/pw_elfldr.c" -o "$work/heap/pw_elfldr.o" || fail "cannot compile pw_elfldr.c"
-process_shims="$process_shims $work/heap/pw_wine_launch.o $work/heap/pw_environment.o $work/heap/pw_elfldr.o"
+"$sdk/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
+    -c "$root/src/pw_fmem_budget.c" -o "$work/heap/pw_fmem_budget.o" || fail "cannot compile pw_fmem_budget.c"
+process_shims="$process_shims $work/heap/pw_wine_launch.o $work/heap/pw_environment.o $work/heap/pw_elfldr.o $work/heap/pw_fmem_budget.o"
 "$sdk/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
     -c "$root/wine/ps5/pw_wine_wallpaper.c" -o "$work/heap/pw_wine_wallpaper.o" || fail "cannot compile wallpaper"
 base="-L$work/ps5lib -lunwind -Wl,--warn-unresolved-symbols"
@@ -713,6 +715,8 @@ if [ "$prx_status" = 0 ]; then
     "$sdk/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
         -c "$root/src/pw_environment.c" -o "$prx/obj/pw_environment.o" || fail "cannot compile pw_environment.c"
     "$sdk/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
+        -c "$root/src/pw_fmem_budget.c" -o "$prx/obj/pw_fmem_budget.o" || fail "cannot compile pw_fmem_budget.c"
+    "$sdk/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
         -c "$root/src/pw_elfldr.c" -o "$prx/obj/pw_elfldr.o" || fail "cannot compile pw_elfldr.c"
     "$sdk/bin/prospero-clang" -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC \
         -c "$root/src/pw_window_page.c" -o "$prx/obj/pw_window_page.o" || fail "cannot compile pw_window_page.c"
@@ -736,7 +740,7 @@ if [ "$prx_status" = 0 ]; then
     # ntdll: the loader, compat, the title's present and input sink, the
     # runtime counters and the sync device; the server registers parent
     # threads while each headless child keeps its own native thread registry.
-    shims="$prx/obj/pw_elfldr.o $prx/obj/pw_environment.o $prx/obj/pw_wine_vm.o $prx/obj/pw_wine_prefix.o $prx/obj/pw_wine_launch.o $prx/obj/pw_ntsync.o $prx/obj/pw_wine_ntsync.o $prx/obj/pw_wine_process.o $prx/obj/pw_wine_process_io.o $prx/obj/pw_wine_threads.o $prx/obj/pw_audio_ring.o $prx/obj/pw_memory_helper.o $prx/obj/pw_memory_service.o"
+    shims="$prx/obj/pw_elfldr.o $prx/obj/pw_environment.o $prx/obj/pw_fmem_budget.o $prx/obj/pw_wine_vm.o $prx/obj/pw_wine_prefix.o $prx/obj/pw_wine_launch.o $prx/obj/pw_ntsync.o $prx/obj/pw_wine_ntsync.o $prx/obj/pw_wine_process.o $prx/obj/pw_wine_process_io.o $prx/obj/pw_wine_threads.o $prx/obj/pw_audio_ring.o $prx/obj/pw_memory_helper.o $prx/obj/pw_memory_service.o"
     for unit in pw_wine_prx pw_wine_dl pw_wine_dl_libc pw_wine_compat pw_wine_compat_libc pw_wine_net_libc \
             pw_wine_sink pw_wine_window pw_wine_pages pw_wine_pages_ps5 pw_wine_blocks pw_wine_dsection pw_wine_dmap pw_window_page pw_wine_perf pw_wine_cwd pw_wine_cwd_libc pw_wine_fdv pw_wine_fdv_libc; do
         shims="$shims $prx/obj/$unit.o"
