@@ -1,5 +1,60 @@
 # Plan
 
+## Raw system-memory spikes, and a prefix saved before SIGKILL (2026-10-22, no console run)
+
+The flexible-pressure guard below is unchanged. Beside it, the title samples the raw resident census about every 200 ms
+(`src/pw_system_pool.h`) and adds helper growth since the memory helper's half-second census. A steady figure under the
+firmware limit is left alone. A rise of 32 MiB while already at the warn line (1450 MiB on firmware 12), any rise within
+32 MiB of the 1600 MiB limit, or the limit itself, SIGSTOPs the helper that grew. If the figure is still at the limit
+250 ms later, that helper is SIGKILLed. The title and the memory helper are never signalled. The flight recorder warns
+at 2 s and ends the Windows helpers at 5 s when the session has presented a frame and then shows none, and either the
+title waits in `vmwait` or the raw census is already at the kill line. The 45 s hang breaker is unchanged. The title's
+compositor scratch is touched before the first frame (`prepare_workspace` in `src/pw_window_compose.c`).
+
+A cut-short session used to lose the prefix. The in-process wineserver never exits, so it does not save on its own.
+The title already asks it to (patch 0886) every 30 s and on the way back to the launcher, and the hive file is fsynced
+before the rename. That save used to run only after helper SIGKILL, inside `return_to_launcher`, so a freeze during the
+kill left the hive in memory, and the directory of the rename was not fsynced. `/data` is a nullfs over `/user/data`,
+bfs on `ssd0.user`, not mounted synchronous. Credential Manager is `user.reg`. crypt32 is unpatched, so a DPAPI master
+key is that hive and the files under `drive_c/users/Mihawk/AppData`. `native/proton_wine.cpp` now flushes the registry
+and fsyncs the prefix directory before SIGKILL, syncs file data before LoadExec, and starts that file sync in the
+background every 30 s. The same behaviour as `cursor/prefix-persist-f005` (`7f27cb3`), folded into this branch so one
+eboot carries both. Host tests `pw_system_pool`, `pw_hang_breaker`, `pw_memory_policy`. Not run on a console.
+
+## Non-JIT data still on the system pool (2026-10-22, no console run)
+
+Sharing JIT code objects does not shrink the system pool: the kernel charges a shared object in full in every process that maps it (a launcher session's helper census went from 1532 to 1568 MiB). Executable pages cannot take direct memory. The movable charge is the non-JIT part of each helper's `sceKernelGetResidentFmemCount`.
+
+From [gate-std-2026-10-21-01](../evidence/gate-std-2026-10-21-01-mihawk-browser.json) (standard PS5, MihawkBrowser, `about:blank`; fmem is the truncated MiB peak, JIT is `converted_kib`):
+
+| Process | System pool | JIT | Non-JIT |
+| --- | --- | --- | --- |
+| browser | 144 MiB | 63,552 KiB (62.06 MiB) | 83,904 KiB (81.94 MiB) |
+| renderer | 68 MiB | 34,960 KiB (34.14 MiB) | 34,672 KiB (33.86 MiB) |
+| utility `storage.mojom.StorageService` | 45 MiB | 12,576 KiB (12.28 MiB) | 33,504 KiB (32.72 MiB) |
+| utility `chrome.mojom.ProcessorMetrics` | no census line (it had exited) | 11,632 KiB | — |
+
+The three processes that printed both figures held **152,080 KiB (148.52 MiB)** of system-pool charge that is not a JIT copy. That is the upper bound on what moving data can take off the pool. The walk's flexible resident was below the JIT copy for the browser (54 MiB) and the renderer (27 MiB), so those two records do not separate mappings from kernel structures. The storage helper's walk (27 MiB) is above its JIT copy, so about 15 MiB was walk-visible non-JIT and 18 MiB of its kernel charge was in no mapping the walk listed. A later 13-helper session is not in this record.
+
+Anonymous sections above one host page, except the wineserver's session mapping (1,327,104 bytes at Wine `1c785966`), now register for direct memory, and a helper maps a registered section from that RAM instead of the shm file. User shared data (one 16 KiB page) and the session stay on the file the server writes. Host tests `pw_wine_dsection`, `pw_wine_dmem_ps5`, `pw_wine_section_dmem`. Not run on a console.
+
+## Flexible pressure and anonymous direct memory (2026-10-22, no console run)
+
+A firmware 12.20 title log showed the resident census (the guard's old input) climb from 944 MiB to 1601 MiB in about
+a minute while flexible memory stayed at 946–948 MiB free and the application pool still had about 10.5 GiB of 11.7 GiB
+free. The census rise (657 MiB) matched the direct-memory the session committed (653 MiB). The guard, whose firmware
+12 default is 1600/1670 MiB, ended the largest helper. `PROTON_SYSTEM_MEMORY_LIMIT=0` in a program's environment did
+not reach the title: the guard reads the title's environment and `/data/ps5proton/memory.conf`, and an explicit value
+used to be held down to the firmware default.
+
+`src/pw_memory_policy.h` feeds the guard the census minus direct-memory growth since the start, keeps a 96 MiB
+flexible-free floor and a 6144 MiB raw-census backstop, and lets a session raise or disable the limit. Helpers with
+the application allocator give a private anonymous mapping that has no address its own direct-memory region
+(`pw_wine_anon_fresh_direct`); executable mappings stay on flexible memory and become JIT at the first execute.
+Host test `pw_memory_policy`. Not run on a console. An earlier attempt to count one shared object once was reverted
+because the kernel's RSS followed the raw census (below, 2026-10-20): if swap-out climbs while flexible free stays
+high, this subtraction is wrong, and `PROTON_SYSTEM_MEMORY_RAW=1` restores the old input.
+
 ## A launcher to its sign-in window on the standard PS5 (2026-10-20, console; the Pro not yet)
 
 The goal (the owner, 2026-10-20): a launcher end to end, installer, start from the installer, the launcher itself, its

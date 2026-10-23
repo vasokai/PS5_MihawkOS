@@ -5,9 +5,12 @@
  * Windows input).
  *
  * The system's libSceKeyboard and libSceMouse are loaded as its modules (sceSysmoduleLoadModule, ids 0x0106 and
- * 0x00a9): a title may not load them by path (0x80020063, measured by prospero-win), and the payload SDK has no
- * libSceMouse stub, so their functions are looked up by name (sceKernelDlsym). They are opened for the user the pad
- * is opened for. One mouse handle takes every mouse (the open parameter's first byte 1, "merged"); one opened
+ * 0x00a9). pw_usb_input_ps5_preload loads them once, before elevation, while the title is still a normal app
+ * (ps5/src/main.cpp). After the /data grant that load is refused (0x80020063 on firmware 12.20). A title may
+ * also not load them by path (the same code, measured by prospero-win). The open then reuses the module the
+ * preload left mapped, through module_handle. sce_sys/param.json has no library allow-list and does not name
+ * either module. The payload SDK has no libSceMouse stub, so their functions are looked up by name
+ * (sceKernelDlsym). They are opened for the user the pad is opened for. One mouse handle takes every mouse (the open parameter's first byte 1, "merged"); one opened
  * without it is tried next. Every keyboard index the system accepts is opened (PW_USB_INPUT_KEYBOARDS, as
  * ProsperoLight's validated input path does) and their keys are merged. A keyboard plugged in again is a new device
  * that the system assigns to a user again: 2026-10-19 (klog/usb-replug/run1), deviceId ...030100 then ...080100 with
@@ -50,7 +53,8 @@ typedef struct PwUsbInputPs5 {
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Loads both modules; call once, early in the title. */
+/* Loads both modules once, before elevation, while the title is still a normal app. Logs
+ * "usb: preload <lib> id=... status=... handle=...". */
 void pw_usb_input_ps5_preload(void (*log)(const char *line));
 /* Opens whichever devices the system has for user; the state is ready either way. */
 void pw_usb_input_ps5_open(PwUsbInputPs5 *usb, int32_t user, void (*log)(const char *line));

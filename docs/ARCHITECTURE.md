@@ -140,8 +140,41 @@ is applied. Title PRXs do not import the private allocator.
 Reservations stay virtual until committed. Commit, zeroing, decommit and release
 use the direct-memory mapper. The payload SDK supplies executable-memory callbacks.
 `WINE_PS5_PAYLOAD_DMEM=0` selects the old system-memory path for diagnostics;
-the guard test deliberately uses it. Native modules/bootstrap and some shared
-transport still consume system memory, so the memory guard remains enabled.
+the guard test deliberately uses it. A private anonymous mapping with no address,
+in a helper whose application allocator is on, is given its own direct-memory
+region (`pw_wine_anon_fresh_direct`). Executable mappings stay on flexible memory:
+the kernel drops execute from direct memory, and code runs from JIT copies.
+Native modules, bootstrap, JIT copies and some shared transport still consume
+flexible memory, so the memory guard remains enabled. It is fed the resident
+census minus direct-memory growth since the start (`src/pw_memory_policy.h`),
+and it still acts when flexible memory is nearly exhausted or the raw census
+passes its backstop. A session sets the limit in `/data/ps5proton/memory.conf`
+or the title's environment; a program's own environment does not reach the title
+when the desktop launched it.
+
+The raw resident census has a second governor (`src/pw_system_pool.h`) that does not
+replace that subtraction. The title samples it about every 200 ms and adds helper growth
+since the memory helper's half-second census, so a new helper is visible before the next
+census. A steady figure under the firmware limit is left alone. On firmware 12 the warn
+line is 1450 MiB and the kill line is the firmware's 1600 MiB. A rise of 32 MiB while
+already at the warn line, any rise within 32 MiB of the kill line, or the kill line
+itself, SIGSTOPs the helper that grew and leaves the title running. If the figure is
+still at the kill line 250 ms later, that helper is SIGKILLed. The helper is the newest
+when each holds a similar flexible charge (the per-process executable copy), and the
+largest when one helper is at least 64 MiB above the newest, at least twice it, and at
+least 96 MiB. It stands down 64 MiB under the warn line, and a paused helper is then
+continued. The flight recorder, after this session has presented one frame, warns at 2 s
+with no new frame and ends the Windows helpers at 5 s when the title waits in `vmwait`
+or the raw census is already at the kill line. The title posts a notice. The 45 s hang
+breaker is unchanged. Before the helpers are SIGKILLed the title flushes the registry
+and fsyncs the prefix directory, and a background file sync runs every 30 s, so a
+cut-short session keeps what it wrote. Thresholds are `PROTON_SYSTEM_POOL`,
+`PROTON_SYSTEM_POOL_WARN`, `PROTON_SYSTEM_POOL_KILL`, `PROTON_SYSTEM_POOL_HOLD`,
+`PROTON_SYSTEM_POOL_RELEASE`, `PROTON_SYSTEM_POOL_SPIKE`, `PROTON_HANG_DISPLAY_MS` and
+`PROTON_HANG_DISPLAY_WARN_MS` in the same `memory.conf` or the title environment.
+`PROTON_SYSTEM_POOL=0` turns the governor off (and so does a flexible-guard limit of 0
+when the pool key is unset). `PROTON_HANG_DISPLAY_MS=0` turns the watchdog off. This
+governor was not run on a console.
 
 **Direct memory shared between processes.** A direct-memory range belongs to the process that allocated it; another process's
 `sceKernelMapDirectMemory` fails with EACCES until the owner grants its pid with `sceKernelProtectDirectMemoryForPID(offset, length,

@@ -228,4 +228,14 @@ int pw_wine_dmem_run_at(PwWineDmem *, uintptr_t address, PwWineDmemRun *run);
 size_t pw_wine_dmem_backed(PwWineDmem *, uintptr_t address, size_t bytes);
 void pw_wine_dmem_stats(PwWineDmem *, PwWineDmemStats *);
 
+/* 1 when a mapping should be given a fresh direct-memory region of its own: private, anonymous, not shared,
+ * not placed at a fixed address, and not executable. A fixed commit inside a reservation Wine already enrolled
+ * stays on that region. An executable mapping stays on flexible memory: the kernel drops execute from direct
+ * memory, and a Unix mmap that asks for execute has to be able to run on return (the first-execute conversion
+ * is for Wine's fault path). Each argument is 0 or nonzero. */
+static inline int pw_wine_anon_fresh_direct(int anonymous, int private_map, int shared, int fixed, int executable)
+{
+    return anonymous && private_map && !shared && !fixed && !executable;
+}
+
 #endif

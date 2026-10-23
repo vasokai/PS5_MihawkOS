@@ -13,7 +13,8 @@
 
 /* A fake direct-memory pool: which ranges are allocated, zeroed, and which pids may map them. */
 enum { MAX = 64 };
-static struct { int64_t at; uint64_t bytes; int zeroed; int pids[20]; unsigned npids; int live; } ranges[MAX];
+/* A dead pid's grant stays until the chunk is released, so a full table plus the process that replaces it needs a spare. */
+static struct { int64_t at; uint64_t bytes; int zeroed; int pids[PW_WINE_DSECTION_PIDS + 4]; unsigned npids; int live; } ranges[MAX];
 static pthread_mutex_t fake_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t next_offset = 0x100000000;
 static int refuse_allocate, refuse_grant, refuse_release, slow_allocate;
@@ -73,7 +74,7 @@ static int fake_grant(void *c, int64_t at, uint64_t bytes, int pid)
     assert(i >= 0 && ranges[i].bytes == bytes);
     if (refuse_grant) { errno = EACCES; status = -1; }
     else if (is_dead(pid)) { dead_grants++; errno = ESRCH; status = -1; }
-    else { assert(ranges[i].npids < 20); ranges[i].pids[ranges[i].npids++] = pid; }
+    else { assert(ranges[i].npids < PW_WINE_DSECTION_PIDS + 4); ranges[i].pids[ranges[i].npids++] = pid; }
     pthread_mutex_unlock(&fake_lock);
     return status;
 }
@@ -149,7 +150,12 @@ int main(void)
     alarm(60);   /* a request that blocks for good fails the test instead of hanging it */
     assert(!pipe(block_pipe));
     pw_wine_dsection_init(&ops);
-    assert(pw_wine_dsection_register(-1, 1, 10, 64u << 20) == -1 && errno == EINVAL);   /* small sections keep their file */
+    /* One host page (user shared data) and the session mapping stay files: the wineserver writes those fds itself. */
+    assert(pw_wine_dsection_register(-1, 1, 9, 16u << 10) == -1 && errno == EINVAL);
+    assert(pw_wine_dsection_register(-1, 1, 9, PW_WINE_DSECTION_SESSION_BYTES) == -1 && errno == EINVAL);
+    assert(!pw_wine_dsection_register(-1, 1, 10, 64u << 20));   /* a client section under the old 256 MiB floor */
+    pw_wine_dsection_release(1, 10);
+    assert(!pw_wine_dsection_collect(NULL, NULL) && !pw_wine_dsection_known(1, 10));
     assert(!pw_wine_dsection_register(-1, 1, 11, size));
     assert(pw_wine_dsection_register(-1, 1, 11, size) == -1 && errno == EEXIST);       /* once */
     assert(pw_wine_dsection_known(1, 11) && !pw_wine_dsection_known(1, 12));
@@ -261,10 +267,10 @@ int main(void)
     /* A full set of processes takes a new one once an admitted process has ended and the collector forgot it. */
     assert(!pw_wine_dsection_register(-1, 1, 50, size));
     for (int p = 0; p < PW_WINE_DSECTION_PIDS; p++) assert(!pw_wine_dsection_page(1, 50, 0, 600 + p, &dmem, &off, &bytes));
-    assert(pw_wine_dsection_page(1, 50, 0, 616, &dmem, &off, &bytes) == -1 && errno == EMFILE);
+    assert(pw_wine_dsection_page(1, 50, 0, 600 + PW_WINE_DSECTION_PIDS, &dmem, &off, &bytes) == -1 && errno == EMFILE);
     mark_dead(600);
     pw_wine_dsection_collect(NULL, NULL);
-    assert(!pw_wine_dsection_page(1, 50, 0, 616, &dmem, &off, &bytes));
+    assert(!pw_wine_dsection_page(1, 50, 0, 600 + PW_WINE_DSECTION_PIDS, &dmem, &off, &bytes));
 
     /* A process that ended and is not yet forgotten does not fail a live one's new chunk: it is dropped instead. */
     assert(!pw_wine_dsection_register(-1, 1, 60, size));

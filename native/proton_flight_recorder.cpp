@@ -109,6 +109,8 @@ void *recorder_main(void *)
     unsigned memory_streak = 0, broker_streak = 0, display_streak = 0;
     uint64_t broker_since = 0;   // when the broker's streak's first busy sample was taken
     bool rows_on = probe_started, rows_proven = false, wedge_seen = false;
+    bool display_presented = false, display_latched = false, display_warned = false, title_vmwait = false;
+    uint64_t display_flat_since = 0;
     struct { int pid; uint64_t runtime_us; } seen[PW_FLIGHT_PIDS] = {};
 #ifdef PS5_GPU_BROKER
     unsigned long long flips_before = proton_gpu_broker_flips();
@@ -119,18 +121,51 @@ void *recorder_main(void *)
         Block block;
         const int decided = verdict.load(std::memory_order_relaxed);
         const uint64_t sampled = monotonic_ms();
-        block.add("fr t=%.1f verdict=%s", (sampled - start) / 1000.0,
-                  decided < 0 ? "-" : decided ? "stalled" : "fine");
-        if (decided >= 0) {
+        int display_stalled = 0, display_warning = 0, pressure = 0;
+        uint64_t flat_ms = 0;
+#ifdef PS5_GPU_BROKER
+        const unsigned long long flips = proton_gpu_broker_flips();
+        const unsigned long long flip_delta = flips - flips_before;
+        if (sources.display_stall_ms) {
+            if (flip_delta > 0) {
+                display_presented = true;
+                display_flat_since = 0;
+                display_latched = false;
+                display_warned = false;
+            } else if (display_presented) {
+                if (!display_flat_since) display_flat_since = sampled;
+                flat_ms = sampled - display_flat_since;
+                if (sources.pressure_mib && sources.census) {
+                    pw_memory_census census{};
+                    if (!sources.census(&census) && (census.system >> 20) >= sources.pressure_mib) pressure = 1;
+                }
+                PwHangDisplay picture = {flat_ms, sources.display_stall_ms, 1, title_vmwait ? 1 : 0, pressure};
+                PwHangVerdict picture_verdict = PW_HANG_FINE;
+                if (!pw_hang_display_decide(&picture, &picture_verdict) && picture_verdict == PW_HANG_STALLED)
+                    display_stalled = 1;
+                else if (sources.display_warn_ms) {
+                    int warning = 0;
+                    if (!pw_hang_display_warn(&picture, sources.display_warn_ms, &warning) && warning)
+                        display_warning = 1;
+                }
+            }
+        }
+#endif
+        if (display_stalled)
+            block.add("fr t=%.1f verdict=stalled present=%llu", (sampled - start) / 1000.0, (unsigned long long)flat_ms);
+        else
+            block.add("fr t=%.1f verdict=%s", (sampled - start) / 1000.0,
+                      decided < 0 ? "-" : decided ? "stalled" : "fine");
+        if (!display_stalled && decided >= 0)
             block.add(" present=%llu", (unsigned long long)present_ms.load(std::memory_order_relaxed));
+        if (display_stalled || decided >= 0) {
             if (census_known.load(std::memory_order_relaxed))
                 block.add(" census=%llu", (unsigned long long)census_ms.load(std::memory_order_relaxed));
             else
                 block.add(" census=-");
         }
 #ifdef PS5_GPU_BROKER
-        const unsigned long long flips = proton_gpu_broker_flips();
-        block.add(" flips=+%llu", flips - flips_before);
+        block.add(" flips=+%llu", flip_delta);
         flips_before = flips;
 #endif
         lock_field(block, "mem_lock", sources.memory_lock_busy ? sources.memory_lock_busy() : -1, memory_streak);
@@ -153,6 +188,10 @@ void *recorder_main(void *)
         if (wedge)
             block.add("wedge broker_busy_s=%u: %s\n", broker_streak,
                       sources.end_helpers ? "ending the game's helpers" : "reporting only");
+        if (display_stalled)
+            block.add("display flat_ms=%llu vmwait=%d pressure=%d: %s\n", (unsigned long long)flat_ms,
+                      title_vmwait ? 1 : 0, pressure,
+                      sources.end_helpers ? "ending the Windows session" : "reporting only");
         if (rows_on) {
             PwFlightRow rows[PW_FLIGHT_PIDS];
             int busy_pid = 0;
@@ -177,6 +216,7 @@ void *recorder_main(void *)
                     block.add("p pid=%d role=%s error=%d\n", row.pid, role, row.error);
                     continue;
                 }
+                if (row.pid == self) title_vmwait = row.wait[0] && !strcmp(row.wait, "vmwait");
                 uint64_t before = row.runtime_us;
                 unsigned slot = 0;
                 while (slot < PW_FLIGHT_PIDS - 1 && seen[slot].pid && seen[slot].pid != row.pid) ++slot;
@@ -213,6 +253,32 @@ void *recorder_main(void *)
             char why[96];
             snprintf(why, sizeof(why), "the GPU broker's client lock held %u s", broker_streak);
             if (sources.end_helpers && !sources.end_helpers(why)) say("flight recorder: the game is already being ended");
+        }
+        if (display_warning && !display_warned) {
+            display_warned = true;
+            const char *because = pressure && title_vmwait ? "the title waits in vmwait and system memory is at the limit" :
+                                   pressure ? "system memory is at the limit" :
+                                   title_vmwait ? "the title waits in vmwait" : "the picture is flat";
+            say("Wine: display watchdog: no new frame for %llu ms while %s: warning",
+                (unsigned long long)flat_ms, because);
+            if (sources.warn_notice)
+                sources.warn_notice("The picture paused. If it does not resume, the Windows session will be ended.");
+        }
+        if (display_stalled && !display_latched) {
+            display_latched = true;
+            const char *because = pressure && title_vmwait ? "the title waits in vmwait and system memory is at the limit" :
+                                   pressure ? "system memory is at the limit" : "the title waits in vmwait";
+            say("Wine: display watchdog: no new frame for %llu ms while %s: %s",
+                (unsigned long long)flat_ms, because,
+                sources.end_helpers ? "ending the Windows session" : "reporting only");
+            if (sources.notice && sources.end_helpers)
+                sources.notice("The picture stopped. The Windows session was ended so the PS5 would keep running.");
+            if (sources.end_helpers) {
+                char why[160];
+                snprintf(why, sizeof(why), "no new frame for %llu ms while %s",
+                         (unsigned long long)flat_ms, because);
+                if (!sources.end_helpers(why)) say("flight recorder: the game is already being ended");
+            }
         }
         if (written >= kRotateBytes) {
             close(log_file);

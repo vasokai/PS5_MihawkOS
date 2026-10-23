@@ -343,7 +343,11 @@ Needs the user present because a Chromium session can freeze the console and nob
 4. **The memory guard and direct memory** (queued 2026-10-12): with `PROTON_SYSTEM_MEMORY_LIMIT=1000
    PROTON_SYSTEM_MEMORY_END=1040` for one run, watch `swap out` in the kernel's `VM Stats` lines. If it stays at 63
    while the census passes 1,000 MiB, the guard should count flexible memory only (direct-memory pages do not swap).
-   (Since 2026-10-14 the title clamps a limit above 870 to 870, so this run as written now closes the program at 870.)
+   (2026-10-22, no console run: the title no longer holds an explicit limit down to the firmware default. Its input is
+   the resident census minus direct-memory growth, plus a flexible-free floor and a raw-census backstop,
+   `src/pw_memory_policy.h`. This swap-out reading is still the check that the subtraction matches the console.
+   `PROTON_SYSTEM_MEMORY_RAW=1` in the title's environment, or in `/data/ps5proton/memory.conf`, feeds the raw census.
+   A limit of 0 there turns the guard off. A program's `game.json` does not reach the title.)
 5. **Does the "RSS x of N" figure apply to direct memory?** `tests/memory-cap-probe.c` (built, host-checked, not yet
    on the console) commits and touches memory in 64 MiB steps, six seconds apart, first as heap (direct memory) and
    then as a section (flexible class), with the guard off:

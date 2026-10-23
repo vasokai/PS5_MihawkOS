@@ -208,7 +208,7 @@ static void round_trip(size_t run)
         /* The previous round's section goes back once its process has ended, as the title's collector does it. */
         pw_wine_dsection_release(7, 42);
         (void)pw_wine_dsection_collect(NULL, NULL);
-        assert(!pw_wine_dsection_register(-1, 7, 42, PW_WINE_DSECTION_MIN_BYTES));   /* the smallest such section */
+        assert(!pw_wine_dsection_register(-1, 7, 42, 256u << 20));   /* the views stay inside one section */
         pw_wine_dmap_init(&client_ops);
     }
 #endif
