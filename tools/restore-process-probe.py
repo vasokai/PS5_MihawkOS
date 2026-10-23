@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Restore what an interrupted tools/run-process-probe.py run left deployed. No launch.
 
-That runner restores the signed production title and runtime modules only while the console is
+That runner restores the production title and runtime modules only while the console is
 idle; a run whose title had to be killed leaves them replaced ("Console busy; signed production
 backups retained"). Once the console is idle again, this puts back the signed production eboot and
-the ntdll, wineserver, win32u and libvulkan modules from their backups, checks each readback, and
-removes the probe's helper, programs, captures, broker results and child logs.
+the ntdll, wineserver, win32u and libvulkan modules from their backups, including each unsigned
+`<name>.prx.elf` (firmware 12.00 and later maps that sibling, not the signed SELF), checks each
+readback, and removes the probe's helper, programs, captures, broker results and child logs.
 
   tools/restore-process-probe.py --name RUN_NAME
 """
@@ -90,8 +91,10 @@ def main():
         original = (backup / (name + '.prx')).read_bytes()
         if original[:4] not in (bytes.fromhex('4f153d1d'), bytes.fromhex('5414f5ee')):
             raise RuntimeError('Production backup must be signed: ' + name)
+        original_elf = (backup / (name + '.elf')).read_bytes()
         ftp.storbinary('STOR ' + RUNTIME + name + '.prx', io.BytesIO(original))
-        modules[name] = verified(download(RUNTIME + name + '.prx'), original, (backup / (name + '.elf')).read_bytes())
+        ftp.storbinary('STOR ' + RUNTIME + name + '.prx.elf', io.BytesIO(original_elf))
+        modules[name] = verified(download(RUNTIME + name + '.prx'), original, original_elf) and download(RUNTIME + name + '.prx.elf') == original_elf
     restoration['modules_restored'] = modules
     removed = {}
     # Production ships the helper loader and these probes (tools/build-production.sh): its copies go back.

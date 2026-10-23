@@ -1,5 +1,26 @@
 # Plan
 
+## Firmware 12 loads `ntdll.prx.elf`, not the signed `ntdll.prx` (2026-10-23, no console run)
+
+A helper on firmware 12.00 and later (this console is 12.20) logs `loading ntdll path=.../ntdll.prx` and then `pw_prx_elf: loaded .../ntdll.prx.elf`. `pw_prx_elf_ps5_load_start` appends `.elf` and maps that sibling. It checks ELF64 little-endian, type `ET_DYN` or `0xFE18`, a 64 MiB cap, and a `PRXDESC1` descriptor at version 1. It does not check a content hash, a protocol word, or a build stamp, so a newer `.prx` beside an older `.prx.elf` is never mapped. That is why the parked-file mismatch line (`wine-ps5: file mismatch ...`, patches 1242 and 1243) did not appear: the installed `ntdll.prx` and `wineserver.prx` were not the modules the helper ran. The console's old siblings were `ntdll.prx.elf` (1,422,236 bytes) and `wineserver.prx.elf` (1,015,380 bytes).
+
+The same stale `ntdll.prx.elf` also hides the direct-memory / big-pool move. Those shims (`pw_wine_dmem_ps5`, `pw_wine_dsection`, `pw_wine_dmap`, `pw_wine_process`) are linked into ntdll, not into a separate module. `wineserver.prx.elf` hides the server half of 1242/1243 (`server/fd.c`, `server/file.c`) and does not contain the direct-memory shims. Against `main` (`b91f6ee`), no other Unix module's sources change on this branch, so a `win32u.prx.elf` (or `ws2_32`, `crypt32`, `winevulkan`, `libvulkan`, and the rest) built from `main` is not stale for this branch. Replacing one of those `.prx` files without its `.prx.elf` would still leave the old elf mapped. The title eboot (memory guard, USB keyboard) is not a Wine `.prx.elf`.
+
+`tools/build-wine-ps5.sh --no-opengl` applied the series, configured, and linked `ntdll.so` and `server/wineserver`. The PE step then stopped (`wrc` could not load `locale.nls` while building `appwiz.cpl`). The PRX step is that script's `link_prx` (prospero-lld `--shared`, then `ps5-native-tool link --module` and `self --sign`), run for ntdll and wineserver after that stop. Both elves are type `0xFE18`, carry `PRXDESC1` version 1 (ntdll count 119, wineserver count 19), and contain `wine-ps5: file mismatch syscall=%s class=%u options=%#x type=%s`. The link logs name no undefined symbol. The same invocation also wrote a `--no-opengl` `win32u.elf`; that is not a replacement for the title's OpenGL `win32u.prx.elf`.
+
+Install both the unsigned elf and the signed SELF, or the next boot loads whatever `.prx.elf` is already there:
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,419,876 | `1d5dcaf0281c0bfa2a337fd031a756ca779ecf4562075a4b509436cdc4a2bafb` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,198,626 | `b0871e4c82c706a6caf0aa31012638974e726300bb0d15e44c93cb2247c5c72b` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/wineserver.prx.elf` | 1,016,676 | `9eae690322a7d8eb7a06d7ccb93cfb14a6d2b0021af48085c88e9f322341c3b4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/wineserver.prx` | 828,779 | `68209da4c00fc572ea51b8f11d4d42d9b5216b1681d7513b38b6456c03a91f48` |
+
+The build products are `.deps/wine-ps5/prx/ntdll.elf` and `wineserver.elf` (staged names above) and `.deps/wine-ps5/prx/sce_module/ntdll.prx` and `wineserver.prx`. Not run on a console.
+
+`tools/run-process-probe.py` and `tools/restore-process-probe.py` uploaded only the signed `.prx`. They now upload and restore `<name>.prx.elf` as well, and refuse a deploy whose installed elf is not the production backup. Patch 1243's `---`/`+++` headers had blank lines between them, so `git apply` rejected the series; those blank lines are gone and the patch bytes are otherwise unchanged.
+
 ## Raw system-memory spikes, and a prefix saved before SIGKILL (2026-10-22, no console run)
 
 The flexible-pressure guard below is unchanged. Beside it, the title samples the raw resident census about every 200 ms
