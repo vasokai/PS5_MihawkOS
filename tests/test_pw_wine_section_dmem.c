@@ -349,12 +349,38 @@ static void direct_round_trip(void)
     assert(!cache.direct_bytes);
 }
 
+/* A 4 KiB view of a direct section is asked as the 16 KiB host page that holds it. An aligned span is unchanged.
+ * Battle.net's Mojo buffers were mapped at 4 KiB and the kernel refused the direct mapping. */
+static uintptr_t recorded_at;
+static size_t recorded_bytes;
+static int64_t recorded_dmem;
+static int record_map(void *c, uintptr_t at, size_t n, int64_t dmem)
+{
+    (void)c;
+    recorded_at = at;
+    recorded_bytes = n;
+    recorded_dmem = dmem;
+    return 0;
+}
+static void host_page_cover(void)
+{
+    static const PwWineDmapOps ops = { NULL, dmap_identity, fake_page, record_map };
+    direct_setup();
+    pw_wine_dmap_init(&ops);
+    assert(pw_wine_dmap_direct(section_fd) == 1);
+    assert(!pw_wine_dmap_map(section_fd, 0x4e10000, 0x1000, 0));
+    assert(recorded_at == 0x4e10000 && recorded_bytes == 16384 && (recorded_dmem & 16383) == 0);
+    assert(!pw_wine_dmap_map(section_fd, 0x4e10000, 0x1c000, 0));
+    assert(recorded_at == 0x4e10000 && recorded_bytes == 0x1c000);
+}
+
 int main(void)
 {
     struct sigaction action = { 0 };
     action.sa_sigaction = on_fault;
     action.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &action, NULL);
+    host_page_cover();
     sequential();
     protections();
     answers();

@@ -1,5 +1,30 @@
 # Plan
 
+## Battle.net dashboard crash after the firmware-12 ntdll (2026-10-23, no console run)
+
+The four files from the section below were installed and hash-checked at 09:50. Battle.net then died as the dashboard loaded (`Unhandled exception 0xe0000008` in thread `4ac` at `7BC33039`). Before that install, Battle.net ran and only WoW crashed. Session 0 `wine-child-208.log` / `wine-child-209.log` are the crashing helper.
+
+What the log shows, and what it does not:
+
+- The helper mapped the new elf: `pw_prx_elf: loaded .../ntdll.prx.elf at 0x200188000+0xb08000`. Anonymous direct memory is in use (`direct memory in use for anonymous memory`, heap from direct memory, `runs=2398 failures=0`, `data_direct=536 MiB`). PR #5's direct-memory path is linked and running. `perf: dmem runs=0` / `dmem_mib=0.0` in `title-last.log` is the title process's own counters. The title does not allocate guest memory, so those stay zero while the helper's census does not.
+- The fatal exception is Chromium. `wine-child-209.log` is wow64 32-bit code at `kernelbase+0x13039` (`addl $0x50, %esp`, the i386 `RaiseException` epilogue). The stack is `e0000008 00000001 00000000 7bc33039`: code `0xe0000008`, `EXCEPTION_NONCONTINUABLE`, no arguments. The caller is `libcef+0x5638cd4`. Just before that, `shared_buffer_dispatcher.cc(298)` prints `Failed to map shared memory region`. `0xe0000008` is CEF's deliberate fatal exception, not a Wine stub and not `0xC0000024`.
+- Those maps fail in `map_file_into_view` with `mmap error Device not configured` (`ENXIO`) at 32-bit views such as `4e10000` for `0x1000` and `0x1c000` bytes, offset 0. The census is `chunk_maps=0 ... asks=88 remembered=64 ask_failures=18`. The 18 failures are those map refusals (nine ranges, each tried twice). The title answered the asks. `pw_wine_dmap_map` then called `sceKernelMapDirectMemory` with alignment 16384. A 4 KiB view is not a legal direct mapping (`0x80020016`), and a view that `map_view` already committed is a mapping, which direct memory does not replace. `pw_wine_dmap_map` turned that into `ENXIO`, and `map_file_into_view` returns `STATUS_NO_MEMORY` instead of sharing the section.
+- The 4 GiB fixed-reservation lines (`0x100000000` at `feffff0000`, `0x80020016`, then `0x8002000c`) are patch 1231's startup probe. They happen before `ntdll.dll` is loaded and the process continues. The `reserving ... refused: 0xc0000018` lines are patch 0891 (`MEM_RESERVE`, `STATUS_CONFLICTING_ADDRESSES`). No `wine-ps5: file mismatch` line was printed, so the logged 1242/1243 paths are not the crash site.
+- The previous console elf (1,422,236 bytes, sha256 prefix `58a89a4b`) is not in this tree, so this build cannot be byte-compared with it. It is 2,360 bytes larger than the 1,419,876-byte elf that crashed. That gap is not a missing direct-memory subsystem: the crashing elf contains `pw_wine_dmap_*` and `pw_wine_dsection_*`, and the helper's direct-memory census moved. `wineserver.prx.elf` from the same install is not on this path. Rebuilding it after the ntdll fix produced the same bytes.
+
+The fix is in the helper, not a new wineserver. `pw_wine_dmap_map` widens a short view to the 16 KiB host pages it touches, still inside the 2 MiB chunk (an aligned span is unchanged). `dmap_map` lays a fixed reservation over the committed view and then maps the section's direct memory into it. Host tests `test_pw_wine_section_dmem` (a `0x1000` map at `0x4e10000` is asked as 16384 bytes; a `0x1c000` map stays `0x1c000`) and `test_pw_wine_dmem_ps5` passed. Not run on a console.
+
+Replace both ntdll files together. The wineserver pair below is unchanged from the 09:50 install. The `--no-opengl` `win32u` this link also writes is not a replacement for the title's OpenGL `win32u.prx.elf`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,419,876 | `473a91f13f608da09e784fa0842ea8f55597d64317344ebed7dcaf176cc7b561` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,198,802 | `daf47dd3899ffaaecb8b2d080226be65179a1b9af350dc194adfec6c718ba3db` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/wineserver.prx.elf` | 1,016,676 | `9eae690322a7d8eb7a06d7ccb93cfb14a6d2b0021af48085c88e9f322341c3b4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/wineserver.prx` | 828,779 | `68209da4c00fc572ea51b8f11d4d42d9b5216b1681d7513b38b6456c03a91f48` |
+
+Build products: `.deps/wine-ps5/prx/ntdll.elf`, `.deps/wine-ps5/prx/sce_module/ntdll.prx`, and the same names for wineserver. The elf that crashed is `ntdll.prx.elf` `1d5dcaf0281c0bfa2a337fd031a756ca779ecf4562075a4b509436cdc4a2bafb` and `ntdll.prx` `b0871e4c82c706a6caf0aa31012638974e726300bb0d15e44c93cb2247c5c72b`.
+
 ## Firmware 12 loads `ntdll.prx.elf`, not the signed `ntdll.prx` (2026-10-23, no console run)
 
 A helper on firmware 12.00 and later (this console is 12.20) logs `loading ntdll path=.../ntdll.prx` and then `pw_prx_elf: loaded .../ntdll.prx.elf`. `pw_prx_elf_ps5_load_start` appends `.elf` and maps that sibling. It checks ELF64 little-endian, type `ET_DYN` or `0xFE18`, a 64 MiB cap, and a `PRXDESC1` descriptor at version 1. It does not check a content hash, a protocol word, or a build stamp, so a newer `.prx` beside an older `.prx.elf` is never mapped. That is why the parked-file mismatch line (`wine-ps5: file mismatch ...`, patches 1242 and 1243) did not appear: the installed `ntdll.prx` and `wineserver.prx` were not the modules the helper ran. The console's old siblings were `ntdll.prx.elf` (1,422,236 bytes) and `wineserver.prx.elf` (1,015,380 bytes).
@@ -8,7 +33,7 @@ The same stale `ntdll.prx.elf` also hides the direct-memory / big-pool move. Tho
 
 `tools/build-wine-ps5.sh --no-opengl` applied the series, configured, and linked `ntdll.so` and `server/wineserver`. The PE step then stopped (`wrc` could not load `locale.nls` while building `appwiz.cpl`). The PRX step is that script's `link_prx` (prospero-lld `--shared`, then `ps5-native-tool link --module` and `self --sign`), run for ntdll and wineserver after that stop. Both elves are type `0xFE18`, carry `PRXDESC1` version 1 (ntdll count 119, wineserver count 19), and contain `wine-ps5: file mismatch syscall=%s class=%u options=%#x type=%s`. The link logs name no undefined symbol. The same invocation also wrote a `--no-opengl` `win32u.elf`; that is not a replacement for the title's OpenGL `win32u.prx.elf`.
 
-Install both the unsigned elf and the signed SELF, or the next boot loads whatever `.prx.elf` is already there:
+The ntdll pair in this table is the one Battle.net crashed on. The replacement hashes are in the section above. Install both the unsigned elf and the signed SELF, or the next boot loads whatever `.prx.elf` is already there:
 
 | Console path | Bytes | SHA-256 |
 | --- | --- | --- |

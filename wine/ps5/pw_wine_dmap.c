@@ -97,7 +97,28 @@ int pw_wine_dmap_map(int fd, uintptr_t address, size_t bytes, uint64_t offset)
         if (lookup(slot, offset, &dmem, &chunk_offset, &chunk_bytes)) return -1;
         const uint64_t inside = offset - chunk_offset, left = chunk_bytes - inside;
         const size_t piece = bytes < left ? bytes : (size_t)left;
-        if (dmap_ops.map(dmap_ops.context, address, piece, dmem + (int64_t)inside)) {
+        /* The kernel maps direct memory in 16 KiB pages. A WoW64 view is a multiple of 4 KiB
+         * (Battle.net's Mojo shared buffers, mapped at 0x4e10000 for 0x1000). Cover the host
+         * pages the piece touches, still inside this chunk, so the bytes asked for stay the
+         * section's. An aligned piece is unchanged. */
+        const uint64_t host = 16384;
+        const uintptr_t map_at = address & ~(uintptr_t)(host - 1);
+        const uint64_t lead = (uint64_t)(address - map_at);
+        if (lead > inside) { failures++; errno = EINVAL; return -1; }
+        const uint64_t map_inside = inside - lead;
+        const uintptr_t chunk_end = address + (uintptr_t)left;
+        uintptr_t map_end = (address + piece + (uintptr_t)(host - 1)) & ~(uintptr_t)(host - 1);
+        if (map_end < address + piece) { failures++; errno = EINVAL; return -1; }
+        if (map_end > chunk_end) map_end = chunk_end;
+        const size_t map_bytes = (size_t)(map_end - map_at);
+        const int64_t map_dmem = dmem + (int64_t)map_inside;
+        if (!map_bytes || map_end < address + piece || (map_at & (host - 1)) || (map_bytes & (host - 1)) ||
+            ((uint64_t)map_dmem & (host - 1))) {
+            failures++;
+            errno = EINVAL;
+            return -1;
+        }
+        if (dmap_ops.map(dmap_ops.context, map_at, map_bytes, map_dmem)) {
             failures++;
             errno = ENXIO;
             return -1;

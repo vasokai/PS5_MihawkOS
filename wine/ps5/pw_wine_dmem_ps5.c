@@ -1136,11 +1136,18 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
             const int direct = pw_wine_dmap_direct(fd);
             if (direct > 0) {
                 if (pw_wine_dmap_map(fd, (uintptr_t)address, bytes, (uint64_t)offset)) return MAP_FAILED;
-                /* Adopt before a protection change: a bare reservation would otherwise be backed with a second
-                 * direct-memory run. The map is read-write; a caller that asked for less is narrowed after. */
-                for (; at < end; at += piece)
-                    if (pw_wine_dmem_split(&dmem, at, end - at, &piece) && pw_wine_dmem_adopt(&dmem, at, piece))
-                        __atomic_store_n(&backing_stale, 1, __ATOMIC_RELAXED);
+                /* Adopt the host pages the map covered, not only the 4 KiB view: a bare reservation of the tail
+                 * would otherwise be backed with a second direct-memory run. The map is read-write; a caller that
+                 * asked for less is narrowed after. */
+                {
+                    const uintptr_t host = 16384;
+                    const uintptr_t cover = (uintptr_t)address & ~(host - 1);
+                    const uintptr_t cover_end = ((uintptr_t)address + bytes + host - 1) & ~(host - 1);
+                    for (at = cover; at < cover_end; at += piece)
+                        if (pw_wine_dmem_split(&dmem, at, cover_end - at, &piece) &&
+                            pw_wine_dmem_adopt(&dmem, at, piece))
+                            __atomic_store_n(&backing_stale, 1, __ATOMIC_RELAXED);
+                }
                 if ((protection & 7) != (PROT_READ | PROT_WRITE) &&
                     __wine_ps5_mprotect(address, bytes, protection)) {
                     __wine_ps5_munmap(address, bytes);

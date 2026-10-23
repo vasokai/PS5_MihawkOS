@@ -141,7 +141,14 @@ static int dmap_map(void *c, uintptr_t address, size_t bytes, int64_t dmem)
     const char *was = pw_wine_perf_vlock_doing("pager-map");   /* under the virtual mutex (pw_wine_perf.h) */
     void *at = (void *)address;
     (void)c;
-    /* CPU read and write, fixed over the view's reservation (as the GPU client maps granted memory). */
+    /* The view was committed as anonymous memory before the file is laid over it. Direct memory maps into a
+     * reservation, not over that mapping: a fixed reserve replaces it in one call (the same lay the engine uses),
+     * then the section's RAM is mapped there. 16 KiB, the kernel's unit; pw_wine_dmap_map widens a 4 KiB view. */
+    if (sceKernelReserveVirtualRange(&at, bytes, 0x10, 16384) || at != (void *)address) {
+        pw_wine_perf_vlock_doing(was);
+        return -1;
+    }
+    at = (void *)address;
     const int status = sceKernelMapDirectMemory(&at, bytes, 0x03, 0x10, dmem, 16384) || at != (void *)address ? -1 : 0;
     pw_wine_perf_vlock_doing(was);
     return status;
