@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Patch an OpenGL win32u.prx.elf so composition stubs return a status.
+"""Patch a console win32u unix image so composition stubs return a status.
 
-The console's win32u.prx.elf is the unsigned module the payload maps
-(native/pw_prx_elf_ps5.c loads "<name>.prx" by opening "<name>.prx.elf").
-That image contains the PS5 OpenGL SDK. Replacing it with a win32u linked
-without the SDK removes the driver.
+The payload maps "<name>.prx" by opening "<name>.prx.elf". The title loads
+win32u.prx.elf, which contains the PS5 OpenGL SDK. A WINE_PS5_CHILD loads
+win32u-helper.prx.elf instead (wine/ps5/pw_wine_dl.c). Both images inline
+the same 192-byte abort stub, so this tool takes either file. Replacing the
+OpenGL module with a win32u linked without the SDK removes the driver.
 
 Clang inlined the original stub_syscall into each `@ stub -syscall`. Each
 one is 192 bytes, raises EXCEPTION_WINE_STUB, and is named by a

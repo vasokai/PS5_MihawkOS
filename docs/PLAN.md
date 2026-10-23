@@ -1,3 +1,22 @@
+## Helper win32u stubs patched in place (2026-10-23, no console run)
+
+88d2f79's OpenGL pair was installed (`22f62466` / `d4d8cfc8`, sizes checked on the console). Classic Era `WoWClassic.exe` (`_classic_era_`, `-launcherlogin`) still aborted nine times, three threads in each of wine-child 244, 245 and 246:
+
+`wine: Call from 000000DFFFD68357 to unimplemented function win32u.NtDCompositionCommitSynchronizationObject, aborting`
+
+Each of those processes mapped `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/win32u-helper.prx.elf` and did not map `win32u.prx.elf`. `WINE_PS5_CHILD` loads `name-helper.prx` when that file is present (`wine/ps5/pw_wine_dl.c`). The game is a child, so the stub that ran is the helper. The desktop's OpenGL module is a different file and was already patched.
+
+The helper attached from the console is 2,703,548 bytes, `fb603252b202a2de952ab98664fe98fd4a3a21ea17191f1b141461e44392fb8f`. Its signed sibling is 2,391,058 bytes, `3e04993fa4ce2aeccc9e61d453938b85fc908312cbc0bf3e2628763960a2dfba`. `NEEDED` is `ntdll.prx`, `libSceLibcInternal.prx` and `libkernel.prx`. `SONAME` is `win32u.prx`. It has the same 1059 inlined 192-byte abort stubs. `tools/patch_win32u_dcomp.py` rewrote the same 164 names: 93 return `STATUS_SUCCESS`, including `NtDCompositionCommitSynchronizationObject` at VA `0xdbf70` (`b8 00 00 00 00 c3`), and 71 return `STATUS_NOT_IMPLEMENTED` (`0xC0000002`), including `NtDCompositionCreateChannel` at VA `0xdc270`. The other 895 abort stubs still begin `55 48 89 e5`. The diff is 166 ranges, 31,158 bytes, all inside those bodies. Program headers, `readelf -d` and the last 4 KiB match the console helper. The name string occurs once. `win32u-helper.prx` is `ps5-native-tool self --sign` of this elf: signed plaintext, authority `0x3100000000000002`, integrity valid. `self --extract` is the same size and differs in the SIE note at the end of the file. Firmware maps the unsigned `.elf`. Install both helper files. Leave the OpenGL pair, `win32u.dll` and the 1258 ntdll files.
+
+`000000DFFFD68357` is the guest `context.Rip` the unix stub copies with `NtGetContextThread`. `dispatch_exception` prints that pointer. In this process `ntdll.dll` (`63b7dab8`) is at `0xDFFFD10000`, so the RVA is `0x58357`: the `ret` in the `NtSetIoCompletion` thunk whose `mov eax` immediate is `0x1a3` at RVA `0x58340`. That byte does not raise. `win32u.dll` is at `0xDFFF530000` and does not cover the address. The function name is the helper stub's argument, not an instruction at the RIP. `WoWClassic.exe` loaded at `0x140000000` (64-bit). `wow64win.dll` was not loaded in these three processes. 32-bit `Battle.net.exe` (base `0x110000`) does load `wow64win.dll` at `0xDFFF580000`, and that PE's `stub_syscall` still raises with `ExceptionAddress` set to itself, so a 32-bit call would print an address inside `wow64win.dll`. `wow64win.prx.elf` failed to open (errno 2). These nine lines are the helper.
+
+This helper image was not run on a console. The abort is not claimed gone.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/win32u-helper.prx.elf` | 2,703,548 | `7cfe10a57b88e8175e0a9f0cbb7755f83d31f2360d01bc26629dea1b09b68a7a` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/win32u-helper.prx` | 2,391,058 | `ce8eb14f1fc50b9060f5a594368f254acf1d6024a0e70183e01df383639e24cb` |
+
 ## OpenGL win32u stubs patched in place (2026-10-23, no console run)
 
 The console's deployed `win32u.prx.elf` is 27,214,348 bytes, SHA-256 `d28717e364aec349e76be19914ed14512618154757aa433ecc2eaeafbec921e1`. `readelf -d` lists `ntdll.prx`, `libSceAgc.prx`, `libSceAgcDriver.prx`, `libSceVideoOut.prx`, `libkernel.prx`, `libSceSystemService.prx` and `libSceLibcInternal.prx`. The file contains `glDrawArrays` (11), `Mesa` (14) and `wglSwapBuffers`. The 2,473,676-byte image from the section below has none of that driver. It is not a drop-in.
@@ -6,7 +25,7 @@ That OpenGL image inlines each `@ stub -syscall`. There are 1059 of them, one 19
 
 `tools/patch_win32u_dcomp.py` writes `mov eax, status; ret` and `int3` over bytes 0 through `0xbd` of the composition, Dxgk, flip and `NtVisualCaptureBits` stubs. The two padding `int3`s at `0xbe` stay. 164 stubs change: 93 return `STATUS_SUCCESS` (`0`), including the commit at `0xe1920`, and 71 return `STATUS_NOT_IMPLEMENTED` (`0xC0000002`). The other 895 abort stubs are byte-identical, including the first unpatched one at VA `0xe1020`, which still begins `55 48 89 e5`. The diff is 168 ranges, 31,156 bytes, all inside those 164 bodies. The program headers, the dynamic segment and the last 4 KiB match the console file. `glDrawArrays` is still 11. There is no `wine-ps5: dcomp-stub` line: a printf would be new code. `wow64win` and ntdll were not rebuilt. 1258 `int 2e` is unchanged.
 
-`win32u.prx` is `ps5-native-tool self --sign` of this elf. The tool reports a signed plaintext SELF, authority `0x3100000000000002`, integrity valid. Re-signing this tree's existing no-OpenGL `win32u.elf` reproduces its `win32u.prx` byte for byte, so the same command is what the build writes. Firmware 13.59 maps the unsigned sibling: `pw_prx_elf_ps5_load_start` opens `"<path>.elf"`. Install both files. Leave `win32u-helper.prx`, `win32u.dll` and the 1258 ntdll files.
+`win32u.prx` is `ps5-native-tool self --sign` of this elf. The tool reports a signed plaintext SELF, authority `0x3100000000000002`, integrity valid. Re-signing this tree's existing no-OpenGL `win32u.elf` reproduces its `win32u.prx` byte for byte, so the same command is what the build writes. Firmware 13.59 maps the unsigned sibling: `pw_prx_elf_ps5_load_start` opens `"<path>.elf"`. Install both files. A `WINE_PS5_CHILD` loads `win32u-helper` instead of this module; that drop-in is the section above. Leave `win32u.dll` and the 1258 ntdll files.
 
 This image was not run on a console. The abort is not claimed gone.
 
