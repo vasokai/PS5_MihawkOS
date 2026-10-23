@@ -1,3 +1,29 @@
+## Illegal instruction after the private execute fault (2026-10-23, no console run)
+
+e019bd8 was installed (`ntdll.prx.elf` `7afcdeaf`, `ntdll.prx` `728c1d98`) with `ntdll.dll` `b2908d0c`. The blank dashboard in the previous section cleared after a restart: this session's title log shows the stall and then 358, 591, 300 and 362 frames in 10 s before WowB. No dashboard change was built.
+
+Patch 1249 ran. Each WowB process logged one line, `vprot=0x23` `view=0x3`: wine-child 774 at `0x1000443fd0`, 772 at `0x1000445ad0`, 770 at `0x1000445b80`. The exit tally is `conversions=1068 converted_kib=17088 convert_failed=0 exec_refused=0`. `1068 * 16` KiB is 17088 KiB, one host page more than the 1067 conversions before this patch. The unpacked fetches are the same two host pages as the earlier execute faults (`0x1000440000` and `0x1000444000`).
+
+Crash.txt `_classic_beta_` `2026-10-23 14.31.49` is the summary `ILLEGAL_INSTRUCTION` and the module list. It has no instruction address, no registers and no stack. The hash block is `DBG-OPTIONS FunctionsOnly` and then empty. `memory.dmp` is named by the following `BlizzardError.exe` and is not in the bundle, and `WowB_loader.dll` is not either, so the opcode bytes are not in this record. ntdll in that list is base `0xDFFFD10000` size `0x2d5000`, timestamp 1792755850, the `b2908d0c` image. `WowB_loader.dll` is base `0xDFFBB50000` size `0x2810000`.
+
+wine-child 774 is the process that names the fault. Immediately after `execute-fault addr=1000443fd0` it logs `virtual_setup_exception stack overflow 1856 bytes addr dffd1de90d stack 10013438c0 (1001340000-1001344000-1001440000)` and then `thread 04d8 killed`. `0xdffd1de90d - 0xDFFBB50000` is RVA `0x168E90D`, inside `WowB_loader.dll`, not inside the converted page. The printed stack is the exception frame. `0x1001344000 - 0x10013438c0` is 1856. That frame sits in the bottom host page `[0x1001340000, 0x1001344000)`, which `virtual_alloc_thread_stack` leaves with no access. `virtual_setup_exception` called `abort_thread` there, before `KiUserExceptionDispatcher`. A vectored handler on that thread did not receive a context, which matches a Crash.txt that names the exception and has no address. 770 and 772 log the same execute-fault and then the title's `kill thread`; each of the three launches has a Crash.txt (`14.31.43`, `14.31.46`, `14.31.49`). Only 774's log has the stack line.
+
+`__wine_ps5_exec_convert` does not leave the guest writing an old mapping. `jit_over` copies the page into a JIT object and maps that object `MAP_SHARED|MAP_FIXED` over the same address. A later store to that address hits the JIT object. The kernel measurement K1 (execute through JIT memory, `docs/PLAN.md`) rewrote a JIT page and ran the new bytes. The faulting RIP is in the loader image, not in `0x1000440000`. Patch 1250 does not change the converter.
+
+`init_shared_data_cpuinfo` uses the `cpuid` and `xgetbv` instructions. `PF_AVX512F_INSTRUCTIONS_AVAILABLE` is leaf 7 EBX bit 16 of that result. No patch in this series replaces those results. A Zen 2 console does not set that bit. CPUID was not changed.
+
+Patch 1250 commits the bottom host page once when the frame lands in it, logs `err:virtual:ps5_open_last_stack_page` with the exception code and 16 bytes at the faulting RIP (at most eight lines), and delivers the original exception. A later frame in that page still aborts. Syscall numbers stay the 19045 table. The PE image was not rebuilt: `SizeOfImage` stays `0x2d5000`, the file stays 3,211,264 bytes, hash `b2908d0c`. The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The protocol dword `a3 03 00 00` still occurs 26 times in the shared ELF. This was not run on a console. The illegal instruction is not claimed gone. The next run's log line is what shows the opcode bytes.
+
+Install the new unix files with the `b2908d0c` `ntdll.dll`. wineserver was not rebuilt.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `b2908d0c9f4d0267e9fcd4808375e9f25ccefa9c3c86a6293eb11267502fbb32` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,421,892 | `22a0f5c510f4acb732427479c8763feda117d565da9052c1f6cb8e6a50df1735` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,208,930 | `04c0dd6ee346aac03d3f3ee46e2fcf603111b3ef1bda37024dcf2c66faf4def8` |
+
+The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,852,248 bytes, `482b1ecfc0232afb83eb2bcbfdb27994534d94178ca789f2122d2377d7bb2a4f`.
+
 ## Battle.net dashboard blank on e019bd8 (2026-10-23)
 
 The installed unix ntdll is e019bd8 (`7afcdeaf` / `728c1d98`) with the `b2908d0c` DLL. Battle.net logs in and the shell stays up. The games list is blank. The console is not frozen. The session has no `wine-ps5: execute-fault` line, no `wine-ps5: ipv6-terminator` line, and no `wine-ps5: callback-fault` line. `convert_failed=0` and `exec_refused=0` in every child. No CEF process exits. No Crash.txt.

@@ -1,0 +1,103 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: deliver an exception in the last stack page
+
+The bottom host page of a thread stack is 16 KiB and has no access. An
+exception frame that landed in it aborted the thread before
+KiUserExceptionDispatcher, so a vectored handler never ran. After patch
+1249 the e019bd8 WowB process fetched 0x1000443fd0, 0x1000445ad0 and
+0x1000445b80, then faulted at WowB_loader+0x168E90D (0xdffd1de90d). The
+frame was 1856 bytes into that page. Crash.txt says ILLEGAL_INSTRUCTION
+and has no address. This commits the page once, logs the exception code
+and 16 instruction bytes, and delivers the original exception. A later
+frame in the same page still aborts. JIT conversion is unchanged: it
+replaces the mapping, so a later write to that address hits the JIT
+object. Syscall numbers are unchanged.
+
+No console run.
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 72133af..d48312b 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -6429,6 +6429,64 @@
+ #endif
+ 
+ 
++#ifdef __PROSPERO__
++/* The bottom host page of a thread stack is 16 KiB and is left with no access
++ * (virtual_alloc_thread_stack). A frame that lands in that page used to abort the thread
++ * before KiUserExceptionDispatcher, so a vectored handler never saw the fault. The e019bd8
++ * WowB process ran the private page patch 1249 converted, then faulted at WowB_loader+0x168E90D
++ * with the frame 1856 bytes into this page; Crash.txt recorded ILLEGAL_INSTRUCTION and the
++ * handler did not run. Commit the page once, log the exception code and 16 instruction bytes,
++ * and deliver the original exception. A later frame in the same page aborts. The virtual mutex
++ * is not held by the caller. */
++static BOOL ps5_open_last_stack_page( char *stack, struct thread_stack_info *info, EXCEPTION_RECORD *rec )
++{
++    static int opened, logged;
++    BYTE bytes[16];
++    char hex[48];
++    SIZE_T nread;
++    unsigned int i, pos;
++    char *page;
++    int wrote, failed;
++
++    page = info->start;
++    if (!page || stack < page) return FALSE;
++
++    if (logged < 8)
++    {
++        logged++;
++        nread = virtual_uninterrupted_read_memory( rec->ExceptionAddress, bytes, sizeof(bytes) );
++        pos = 0;
++        hex[0] = 0;
++        for (i = 0; i < nread && i < sizeof(bytes); i++)
++        {
++            wrote = snprintf( hex + pos, sizeof(hex) - pos, "%02x", bytes[i] );
++            if (wrote < 0 || (unsigned int)wrote >= sizeof(hex) - pos) break;
++            pos += wrote;
++        }
++        ERR( "stack overflow %u bytes code=%#x addr=%p bytes=%s stack %p (%p-%p-%p)\n",
++             (unsigned int)(info->start + host_page_size - stack), rec->ExceptionCode,
++             rec->ExceptionAddress, hex, stack, info->start, info->limit, info->end );
++    }
++    if (opened >= 4) return FALSE;
++    opened++;
++    mutex_lock( &virtual_mutex );
++    set_page_vprot( page, host_page_size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
++    failed = mprotect_range( page, host_page_size, 0, 0 );
++    if (!failed)
++    {
++        if (info->is_wow)
++        {
++            WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
++            if (wow_teb) wow_teb->Tib.StackLimit = PtrToUlong( page );
++        }
++        else NtCurrentTeb()->Tib.StackLimit = page;
++    }
++    mutex_unlock( &virtual_mutex );
++    return !failed;
++}
++#endif
++
++
+ /***********************************************************************
+  *           virtual_setup_exception
+  */
+@@ -6455,10 +6513,16 @@
+     if (stack < stack_info.start + host_page_size)
+     {
+         /* stack overflow on last page, unrecoverable */
++#ifdef __PROSPERO__
++        /* A 16 KiB host page is the whole hard guard. Open it once so the original exception
++         * (an illegal instruction the loader's handler may catch) is delivered. */
++        if (!ps5_open_last_stack_page( stack, &stack_info, rec )) abort_thread(1);
++#else
+         UINT diff = stack_info.start + host_page_size - stack;
+         ERR( "stack overflow %u bytes addr %p stack %p (%p-%p-%p)\n",
+              diff, rec->ExceptionAddress, stack, stack_info.start, stack_info.limit, stack_info.end );
+         abort_thread(1);
++#endif
+     }
+     else if (stack < stack_info.limit)
+     {
