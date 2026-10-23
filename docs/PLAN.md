@@ -1,3 +1,22 @@
+## Leave the loader's pop rsp (2026-10-23, no console run)
+
+1260 is what wine-child 151 and 152 ran. Each `NtSetIoCompletion` of handle `-1` returned `0xC0000024` twice, then the loader stored one byte `0x5c` at `ntdll+0x58340`. The live head is `5c 8b d1`: `pop rsp; mov edx, ecx`. `pop rsp` loads the guest return, `kernelbase+0x3faea`, into `rsp`. That address is not 8-aligned and it is outside the thread stack. `SystemCall` bit 0 is set, so `jne +3` skips `0f 05` and the stub `call`s `[0x7ffe4000]`. The dispatcher pops the return into the frame, switches to the kernel stack, and the epilogue returns to the `ret` at stub `+0x14` with `frame->rsp` still that guest return. The `ret` pops the qword at `kernelbase+0x3faea`. Those file bytes are `89 c6 85 c0 74 14 89 f1`, the address `0xf1891474c085c689`, which is not canonical, so the `ret` is `#GP(0)`. `call_seh_handlers` then sets `EXCEPTION_STACK_INVALID` (`invalid frame`), and `NtRaiseException`'s second chance calls `NtTerminateProcess`. The nine-byte store at `kernelbase+0x3fae1` is after the repaired return, so this path does not reach it.
+
+ps5-forever-wine `ee64b784` has the same `PostQueuedCompletionStatus` and the same dispatcher prologue: no stack repair, `SystemCall` 1, `call [0x7ffe4000]`. Its `call_seh_handlers` and `NtRaiseException` terminate the process on an invalid frame the same way. 1254 already ran this sequence on the console: trap 9 at `ntdll+0x58354`, `rsp` `0xdfffa2faea`, `invalid frame`, then `payload doom seen reason=exit`. Forever's code does that too. The repair is what diverged. It put `rsp` back on the slot that still held the popped qword and set `r10` from the saved `rcx`, so the third call returned `0xC0000024` with handle `-1` and the loader continued into `add al, byte ptr [r10]` at `kernelbase+0x3fae1`.
+
+Patch 1263 leaves a thunk whose head is `5c 8b d1`. `frame->rsp` and `r10` stay as the patched stub left them. The line is `wine-ps5: stub-repair leave ... why=pop-rsp`, at most 32. Any other rewritten head is still put back on the thread stack. An intact `4c 8b d1` never enters the repair. Mihawk, explorer and Battle.net do not store `5c`. `SystemCall` is not stored as 0 and `int 2e` is not installed. The `0x7ffe4000` map is the 1260 map.
+
+Expected on the console, from the 1254 capture and this trace: `stub-repair leave` for id `0x1a3`, then `#GP` at the `ret` `ntdll+0x58354` with `rsp` at `kernelbase+0x3faea`, then `invalid frame` and `payload doom seen reason=exit`. The three `kernelbase+0x3fae1` reads should be absent. A window is not expected. This image was not run.
+
+The checker exits 0: 257 match Windows, 258 entries, 1 Wine-only, 216 holes, max id `0x1d9`. Protocol `0x3a3` compare stays at `0x36280`. `movl $0x3a3, %edx` stays at `0x36594`. The `je` moved from `0x92603` to `0x92653`. No compare of `0x3a2`. `NEEDED` is `libSceLibcInternal.prx` and `libkernel.prx`. `SONAME` is `ntdll.prx`. The PE stays `63b7dab8` (3,211,264 bytes). `sfc_os.dll`, wineserver, win32u and the 32-bit images were not rebuilt.
+
+Install these two. Leave `ntdll.dll`, the OpenGL win32u pair (`22f62466` / `d4d8cfc8`), the helper pair (`7cfe10a5` / `ce8eb14f`) and both `sfc_os.dll` files. The 1261 pair (`0650069d` / `81ec9a0b`) is not this image.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,438,628 | `8cb76a4b9d69203c2cf2d29e83c12e7646370c97a4bd97b16a277c52e705b651` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,234,210 | `4f7afad310319f412234f720af0196077ccc3582b7fbb504665c9d7e519953fd` |
+
 ## PostQueuedCompletionStatus read after the 1260 dispatcher (2026-10-23)
 
 1260 was installed (`ntdll.prx.elf` `49a47bde`, `ntdll.prx` `97adf90d`, dll `63b7dab8`). 35 processes log `syscall-dispatch ... path=call addr=0x7ffe4000 ready=1`. There is no `path=int2e`. wine-child 138 logs `wow-loader image=WoWClassic.exe recognized=1` twice. The old three faults are absent: no `ntdll+0x5834b` `#GP`, no `kernelbase+0x3f498` write, no `WowClassic_loader+0x1c9d710` null write. Play still returns to Play. Battle.net, process 138, stays the foreground presenter (74 to 387 frames in each 10 s through title second 100).

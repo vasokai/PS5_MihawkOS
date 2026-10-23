@@ -1,0 +1,52 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: leave the loader's pop rsp
+
+The one-byte store 5c over 4c 8b d1 is pop rsp. ps5-forever-wine
+ee64b784 does not repair it. Putting rsp and r10 back made the
+third NtSetIoCompletion return 0xC0000024 and reach the
+kernelbase+0x3fae1 probe. This leaves that rsp and the caller's
+r10. Other rewritten heads are still repaired. No console run.
+---
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-10-23 19:25:29.693704710 +0000
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-10-23 19:25:29.721704647 +0000
+@@ -3847,7 +3847,10 @@
+  * when frame->rsp is outside the thread stack. Returns the r10 the service
+  * call should use. An intact thunk (4c 8b d1) is left unchanged: Mihawk,
+  * explorer, Battle.net and every WowB syscall before the loader's store take
+- * that return. The repaired entry is a thunk whose first byte was rewritten. */
++ * that return. A thunk whose first byte is still 4c is not this function's
++ * to change. The loader's one-byte store, 5c over 4c 8b d1, is left as
++ * written: pop rsp has loaded the guest return into rsp, and r10 stays the
++ * caller's. Other rewritten heads are still put back on the thread stack. */
+ ULONG64 ps5_repair_patched_stub( struct syscall_frame *frame, TEB *teb, ULONG64 guest_rcx )
+ {
+     static int depth, lines;
+@@ -3879,12 +3882,24 @@
+         !(head[0] == 0x4c && head[1] == 0x8b && head[2] == 0xd1))
+     {
+         stub = rip - PS5_STUB_RET;
+-        /* 5c 8b d1 is pop rsp; mov edx, ecx. mov r10, rcx did not run, and the
+-         * dispatcher has already overwritten rcx. The entry saved the guest value. */
++        /* 5c 8b d1 is pop rsp; mov edx, ecx. The loader wrote the 5c. Forever
++         * has no repair, so the epilogue returns to the stub's ret with this
++         * rsp and the caller's r10. Putting the stack slot back made the 2103
++         * call return 0xC0000024 and reach the kernelbase probe. */
+         if (head[0] == 0x5c && head[1] == 0x8b && head[2] == 0xd1)
+         {
+-            r10 = guest_rcx;
+-            frame->r10 = r10;
++            if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) < 32)
++            {
++                snprintf( line, sizeof(line),
++                          "wine-ps5: stub-repair leave id=%#x stub=%p head=%02x%02x%02x rsp=%p "
++                          "r10=%#llx rdx=%#llx rcx=%#llx why=pop-rsp\n",
++                          frame->syscall_id, (void *)stub, head[0], head[1], head[2],
++                          (void *)rsp, (unsigned long long)r10,
++                          (unsigned long long)frame->rdx, (unsigned long long)guest_rcx );
++                ps5_log_line( line );
++            }
++            __atomic_fetch_sub( &depth, 1, __ATOMIC_RELAXED );
++            return r10;
+         }
+         slot = ps5_find_stack_slot( limit, base, rsp, &slots );
+         if (slot) frame->rsp = slot;
