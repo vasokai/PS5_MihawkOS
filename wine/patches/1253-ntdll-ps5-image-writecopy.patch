@@ -1,0 +1,173 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: make an exec-converted image page writable
+
+1252 was installed (7038bb30/703f7cbc, dll 63b7dab8). Crash.txt 15.45.38
+is the same write. The access-fault lines are two stores from the loader
+into kernel32 and ntdll image pages the exec conversion left JIT R|X
+(unix 0x5). 0xa5 is COPIED|COMMITTED|EXEC|READ. WRITECOPY is 0x08 and was
+not set. The page byte has no write, so the 4 KiB step does not run, and
+the store is delivered.
+
+A write fault on a committed executable image page whose byte, or another
+byte of its host page, has write, write-copy or copied, and whose own unix
+protection does not already include write, makes that 4 KiB page a private
+writable copy and makes the host page writable. Execute stays. mprotect is
+tried first. When the kernel still lacks write, the JIT object is replaced.
+NtProtectVirtualMemory of such a page to a writable protection applies that
+protection on the host the same way. A protection that dropped execute is
+applied as read-write, and the next execute fault converts again. At most
+16 lines, wine-ps5: image-writecopy. The 1252 lines stay.
+
+Syscall numbers are unchanged. The compare of protocol 0x3a3 is the same
+instruction. No console run.
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 2008b0a..a8940f0 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -218,6 +218,8 @@ static BOOL host_prot_unchanged( const void *addr, size_t len, int prot )
+ extern void *__wine_ps5_mmap( void *addr, size_t len, int prot, int flags, int fd, off_t off );
+ extern int __wine_ps5_exec_convert( void *address, size_t bytes, int unix_prot );
+ extern int __wine_ps5_host_allows( const void *address, int access );
++extern int __wine_ps5_host_has( const void *address, int access );
++extern int __wine_ps5_jit_reprotect( void *address, size_t bytes, int unix_prot );
+ extern void __wine_ps5_exec_refused( const void *address );
+ extern int __wine_ps5_munmap( void *addr, size_t len );
+ extern int __wine_ps5_mprotect( void *addr, size_t len, int prot );
+@@ -2637,6 +2639,22 @@ static unsigned int ps5_save_vprot( char *base, size_t size )
+     }
+     return size ? 0 : count;
+ }
++
++/* One host page, writable under prot (READ and WRITE are added; EXEC stays as the caller set it).
++ * mprotect first. A JIT page the exec conversion left R|X is replaced (1252: unix 0x5, the kernel
++ * still refused the write). 0, or -1. */
++static int ps5_host_make_writable( char *page, int prot )
++{
++    prot |= PROT_READ | PROT_WRITE;
++    if (!mprotect_exec( page, host_page_size, prot ) && __wine_ps5_host_has( page, PROT_WRITE ))
++    {
++        host_prot_record( page, host_page_size, prot | HOST_PROT_KNOWN );
++        return 0;
++    }
++    if (__wine_ps5_jit_reprotect( page, host_page_size, prot )) return -1;
++    host_prot_record( page, host_page_size, prot | HOST_PROT_KNOWN );
++    return 0;
++}
+ #endif
+ 
+ /***********************************************************************
+@@ -2676,6 +2694,29 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
+         errno = EEXIST;
+         return FALSE;
+     }
++    /* NtProtectVirtualMemory of an exec-converted image page to RW or RWX. The page byte now
++     * includes write, and the host page has to as well: sceKernelMprotect of a JIT object left
++     * R|X reports success and drops the write. A protection that keeps execute stays executable.
++     * One that dropped it is applied as read-write, and the next execute fault converts again. */
++    if (size && (view->protect & SEC_IMAGE))
++    {
++        char *host = ROUND_ADDR( base, host_page_mask );
++        char *end = (char *)ROUND_ADDR( (char *)base + size - 1, host_page_mask ) + host_page_size;
++
++        for (; host < end; host += host_page_size)
++        {
++            int prot = get_host_page_unix_prot( host, 0, 0 );
++
++            if (!(prot & PROT_WRITE) || __wine_ps5_host_has( host, PROT_WRITE )) continue;
++            if (!(prot & PROT_EXEC) && !__wine_ps5_host_has( host, PROT_EXEC )) continue;
++            if (!ps5_host_make_writable( host, prot )) continue;
++            if (!saved) set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
++            for (i = 0; i < saved; i++)
++                set_page_vprot( ps5_saved_vprot[i].base, ps5_saved_vprot[i].size, ps5_saved_vprot[i].vprot );
++            mprotect_range( base, size, 0, 0 );
++            return FALSE;
++        }
++    }
+     return TRUE;
+ #else
+     return !mprotect_range( base, size, 0, 0 );
+@@ -6185,6 +6226,69 @@ static BOOL ps5_promote_private_exec( void *addr, char *page )
+     return FALSE;
+ }
+ 
++/* A store into an image page the exec conversion left R|X. 1252: kernel32+0x110e4 was
++ * vprot 0xa5 (COPIED|COMMITTED|EXEC|READ, unix 0x5) and ntdll+0x58340 was vprot 0x25
++ * with the host page's other bytes 0xa5. VPROT_COPIED is 0x80. WRITECOPY is 0x08 and was
++ * not set. The write-copy fault updates nothing the
++ * kernel will honour, the store is delivered, and the loader's handler then runs. The
++ * faulting 4 KiB page becomes a private writable copy, as does any executable page in the
++ * host page that is already write, write-copy or copied. The host page is made writable
++ * and executable. The virtual mutex is held. */
++static BOOL ps5_image_exec_write( void *addr, char *page )
++{
++    struct file_view *view = find_view( addr, 0 );
++    BYTE page_v = get_page_vprot( addr );
++    BYTE host_v = get_host_page_vprot( page );
++    BYTE saved[4];
++    size_t i, n;
++    int prot;
++    static int lines;
++    const BYTE interest = VPROT_WRITE | VPROT_WRITECOPY | VPROT_COPIED;
++    char *fault_page = ROUND_ADDR( addr, page_mask );
++
++    if (!view || !(view->protect & SEC_IMAGE)) return FALSE;
++    if (!(page_v & VPROT_COMMITTED) || (page_v & VPROT_GUARD) || !(page_v & VPROT_EXEC)) return FALSE;
++    if (!(page_v & interest) && !(host_v & interest)) return FALSE;
++    if (get_unix_prot( page_v ) & PROT_WRITE) return FALSE;
++
++    n = host_page_size / page_size;
++    if (!n || n > ARRAY_SIZE(saved)) return FALSE;
++    for (i = 0; i < n; i++)
++    {
++        char *p = page + i * page_size;
++
++        saved[i] = get_page_vprot( p );
++        /* Nothing is written until every 4 KiB page belongs to this image view. */
++        if (find_view( p, 0 ) != view) return FALSE;
++    }
++    for (i = 0; i < n; i++)
++    {
++        char *p = page + i * page_size;
++        BYTE b = saved[i];
++
++        if (!(b & VPROT_COMMITTED) || (b & VPROT_GUARD) || !(b & VPROT_EXEC)) continue;
++        if (p != fault_page && !(b & interest)) continue;
++        set_page_vprot_bits( p, page_size,
++                             VPROT_READ | VPROT_WRITE | VPROT_EXEC | VPROT_COMMITTED | VPROT_COPIED,
++                             VPROT_WRITECOPY );
++    }
++    /* The store is in code. Keep the host page executable so the instruction runs again. */
++    prot = get_host_page_unix_prot( page, 0, 0 ) | PROT_EXEC;
++    if (!(prot & PROT_WRITE) || ps5_host_make_writable( page, prot ))
++    {
++        for (i = 0; i < n; i++) set_page_vprot( page + i * page_size, page_size, saved[i] );
++        mprotect_range( page, host_page_size, 0, 0 );
++        return FALSE;
++    }
++    if (lines < 16)
++    {
++        lines++;
++        fprintf( stderr, "wine-ps5: image-writecopy addr=%p vprot=%#x hostv=%#x prot=%#x\n",
++                 addr, page_v, host_v, prot );
++    }
++    return TRUE;
++}
++
+ /***********************************************************************
+  *           ps5_fault_served
+  *
+@@ -6291,6 +6395,13 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
+     }
+     else if (err == EXCEPTION_WRITE_FAULT)
+     {
++#ifdef __PROSPERO__
++        if (ps5_image_exec_write( addr, page ))
++        {
++            ret = STATUS_SUCCESS;
++            goto done;
++        }
++#endif
+         if (vprot & VPROT_WRITEWATCH)
+         {
+             if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !ntdll_get_thread_data()->allow_writes)

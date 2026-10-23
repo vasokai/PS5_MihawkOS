@@ -903,6 +903,34 @@ int __wine_ps5_host_allows(const void *address, int access)
     return 1;
 }
 
+/* 1 when the kernel holds access (PROT_*) at address. Does not count. */
+int __wine_ps5_host_has(const void *address, int access)
+{
+    return kernel_allows((uintptr_t)address, 1, access);
+}
+
+/* Wine asked for write on a JIT page the exec conversion left R|X (1252: image code, unix 0x5).
+ * sceKernelMprotect to unix_prot, and when the kernel still lacks a bit of it, replace the JIT
+ * object and protect again. 0, or -1 with errno. bytes is one host page, the object jit_over maps. */
+int __wine_ps5_jit_reprotect(void *address, size_t bytes, int unix_prot)
+{
+    const uintptr_t at = (uintptr_t)address;
+    const char *step = "mprotect";
+    const unsigned need = (unsigned)unix_prot & 7;
+
+    if (!payload_mmap || !bytes || at % PAGE || bytes % PAGE || !need) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!payload_protect(address, bytes, unix_prot) && kernel_allows(at, bytes, (int)need)) return 0;
+    if (jit_over(at, bytes, &step)) return -1;
+    if (payload_protect(address, bytes, unix_prot) || !kernel_allows(at, bytes, (int)need)) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
 /* An execute fault Wine allows that nothing can serve (a section or file view, or a failed conversion): counted, and
  * the first ones and then one in 1024 logged. */
 void __wine_ps5_exec_refused(const void *address)

@@ -1,3 +1,37 @@
+## Writable copy of an exec-converted image page (2026-10-23, no console run)
+
+1252 was installed and the hashes match the table in the next section: `ntdll.dll` `63b7dab8`, `ntdll.prx.elf` `7038bb30`, `ntdll.prx` `703f7cbc`. Crash.txt `_classic_beta_` `15.45.38` is the same line: `ACCESS_VIOLATION (Failed to write address 0x000000DFFDB67E3B at instruction 0x000000DFFFD638C0)`. wine-child 1040 is the WowB process. It ends at `conversions=1067` `converted_kib=17072` `convert_failed=0` `exec_refused=0` and `mmu4k total runs=0`. There is no `execute-fault` line. Signal pc, context RIP and `ExceptionAddress` match on every access-fault line, so the signal path is not inventing the RIP.
+
+Three access faults, in file order:
+
+1. `pc=WowB_loader.dll+0x2007367` writes `ntdll.dll+0x58340`. The 16 bytes are `88 08 c3` (`mov [rax], cl` then `ret`). `rcx=0x5c`. That address is the first byte of the `NtSetIoCompletion` stub. The fault view is an image, `vprot=0x25` `hostv=0xa5` `unix=0x5`.
+2. `pc=WowB_loader.dll+0x2007347` writes `kernel32.dll+0x110e4`. The 16 bytes are `89 08 66 44 89 40 04 c3` (`mov [rax], ecx` then `mov [rax+4], r8w` then `ret`). `rcx=0x202e25ff`. The fault view is an image, `vprot=0xa5` `hostv=0xa5` `unix=0x5`.
+3. `pc=ntdll.dll+0x538c0` writes `WowB_loader.dll+0x2017e3b`. The 16 bytes are `49 89 3f 4c 89 f1 8b 51 08 31 c0 48 85 d2 74 54` (`movq %rdi, (%r15)`). Those bytes are file RVA `0x549c0`, `RtlSelfRelativeToAbsoluteSD+0x330`, not the hotpatch NOP at `RtlEqualPrefixSid`. The return is `kernelbase.dll+0x405e8`. The fault view is a map, base `dffdb60000` size `0x90000` alloc `0x8400021`, `vprot=0x21` `hostv=0x21` `unix=0x1`. It is read-only. It is not an image.
+
+`0xa5` is `VPROT_COPIED|VPROT_COMMITTED|VPROT_EXEC|VPROT_READ` (`0x80|0x20|0x04|0x01`). `VPROT_WRITECOPY` is `0x08` and is not set on either page. `0x25` is `VPROT_COMMITTED|VPROT_EXEC|VPROT_READ`. `hostv=0xa5` on the ntdll page is the OR of the 16 KiB host page: a neighbouring 4 KiB page has `VPROT_COPIED`. `unix=0x5` is `PROT_READ|PROT_EXEC`. `get_unix_prot` maps `VPROT_WRITE` and `VPROT_WRITECOPY` to `PROT_WRITE`. `VPROT_COPIED` alone does not. After the exec conversion the page is a shared JIT object protected with that unix value, so a store faults. Nothing in the write-fault path copies the page, and the 4 KiB step requires the page's own unix protection to include write. These pages do not, so `mmu4k total runs=0` and the exception is delivered.
+
+The image-protect log, capped at 64 lines and full before these stores, is 306 times `ntdll.dll+0xab000` size `0x3010` new `4` old `4` (`.mrdata`, already `PAGE_READWRITE`) and 16 times each way on `WowB_loader.dll+0x2070000` between `4` and `2`. Every status is 0. No line names `ntdll+0x538c0`, `ntdll+0x58340` or `kernel32+0x110e4`. There is no image-write line.
+
+Patch 1253 handles the two image stores. A write fault on a committed, non-guard, executable image page qualifies when that page's byte, or the host page's OR, has `VPROT_WRITE`, `VPROT_WRITECOPY` or `VPROT_COPIED`, and the page's own unix protection does not already include write. The faulting 4 KiB page, and any executable neighbour in the host page that already has one of those bits, becomes read, write, execute, committed and copied, and loses write-copy. The host page is then made writable and kept executable, so the whole 16 KiB page is kernel-writable. `sceKernelMprotect` runs first. When the kernel still lacks write, `__wine_ps5_jit_reprotect` replaces the JIT object and protects it again. The instruction runs again. A host page whose bytes are only read and execute is left alone. The loader's read-only map (`vprot=0x21`) is left alone. At most 16 lines a process:
+
+`wine-ps5: image-writecopy addr=… vprot=… hostv=… prot=…`
+
+`NtProtectVirtualMemory` of an image host page whose combined unix protection includes write, while the kernel still has execute and lacks write, applies that protection on the host through the same function. A protection that keeps execute stays executable. A protection that dropped execute is applied as read-write, and the next execute fault converts the page again. The access-fault, image-protect and image-write lines stay. A store this path completes does not also write an access-fault line.
+
+The two loader stores are the hotpatch. If they complete, the handler that then executed `RtlSelfRelativeToAbsoluteSD+0x330` at `RtlEqualPrefixSid` should not run. That is a hypothesis. This build was not run on a console, and the Crash.txt line is not claimed gone. Writing `0x5c` over the first byte of the `NtSetIoCompletion` stub is what the store asked for. The next run's `image-writecopy` line, or the access-fault line if the store still faults, is the evidence.
+
+Syscall numbers stay the 19045 table. The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The compare of protocol `0x3a3` is still the one instruction `81 fe a3 03 00 00` at VA `0x35f60`. `movl $0x3a3, %edx` is still the one instruction at VA `0x36274`. `.text` holds the dword `a3 03 00 00` three times: those two immediates, and the displacement of a `je` at VA `0x8fd73` (`0f 84 a3 03 00 00`). The 1252 image had a fourth, the displacement of a `call` at VA `0x77b68` (`e8 a3 03 00 00`), and that displacement moved with this code. The whole file holds the dword 30 times. Twenty-five of the rest are in `.debug_loc` (18), `.debug_info` (3), `.debug_ranges` (2), `.debug_aranges` (1) and `.debug_line` (1). The other two sit in `.dynsym` and `.symtab`. The PE image was not rebuilt: `SizeOfImage` stays `0x2d5000`, the file stays 3,211,264 bytes, hash `63b7dab8`. wineserver was not rebuilt. The 32-bit ntdll and wow64 were not rebuilt.
+
+Install the new unix files with the `63b7dab8` `ntdll.dll`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `63b7dab8c8e872cb375a0d051c5b8eb97ec744e88f31a0ea229c1f6e7f1bd3e4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,438,420 | `dfbe818695cee099d1e719614d9ba2ec07e7ea70eba0244115ff0f176fb068da` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,221,154 | `db0a6ff05691fa5a7148d7d72e6bda06a564caf09b8df55962eb79c067a1cfee` |
+
+The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,901,376 bytes, `d41e07c0519749dbd8df870f71db1ffd1cdcc5f3974409564de049a6051d9c4f`.
+
 ## Access-fault log for the RtlEqualPrefixSid write (2026-10-23, no console run)
 
 5653f96 was installed and the hashes match the table in the next section: `ntdll.dll` `63b7dab8`, `ntdll.prx.elf` `0ff63726`, `ntdll.prx` `88d99515`. Both WowB Crash.txt lines write `WowB_loader+0x2017E3B` from ntdll+`0x538C0`, the first byte of `RtlEqualPrefixSid`. The file bytes there are `66 90 55 56 48 83 ec 38 48 8d 6c 24 30 48 89 4d 00`. `66 90` is the hotpatch NOP. The body reads both SIDs and calls `memcmp`. wine-child 869 and 871 end at `conversions=1067` `mmu4k total runs=0` and have no `illegal-instruction`, `vectored-handler` or `execute-fault` line. Two readings of that RIP are still open. The bytes at that address in the running process can differ from the file, because a hotpatch NOP is where a loader places a `jmp`. The instruction Crash.txt prints is `ExceptionAddress`, and it can differ from the signal frame's pc.
