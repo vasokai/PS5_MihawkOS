@@ -1,0 +1,113 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: do not write an IPv6 terminator in kernel space
+
+RtlIpv6StringToAddress stores the scan pointer through the caller's
+terminator. On the dfbaa50 console run that pointer was
+0xFFFFFC8009CC8C80, a canonical kernel address, and the write became
+WoW's launch dialog. Wine's own callers pass NULL or a stack address.
+A pointer whose bits 63:47 are set now returns STATUS_ACCESS_VIOLATION
+and does not raise. A user pointer is stored as before.
+
+No console run.
+---
+diff --git a/dlls/ntdll/rtlstr.c b/dlls/ntdll/rtlstr.c
+index f494d97..36ad310 100644
+--- a/dlls/ntdll/rtlstr.c
++++ b/dlls/ntdll/rtlstr.c
+@@ -22,6 +22,7 @@
+ 
+ #include <assert.h>
+ #include <stdarg.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -2150,8 +2151,42 @@ static BOOL parse_ipv6_component(const WCHAR **str, int base, ULONG *value)
+     return TRUE;
+ }
+ 
++/* The out-pointer is the caller's. A kernel or non-canonical address is not a
++ * guest pointer: the write raises, and WoW's filter turns that into the launch
++ * dialog. Wine's own callers pass NULL or a stack address. Bits 63:47 clear is
++ * the user half. Do not raise. */
++extern int WINAPI __wine_dbg_write( const char *str, unsigned int len );
++
++static inline NTSTATUS ps5_store_terminator( const WCHAR **terminator, const WCHAR *at, void *caller )
++{
++    if (!terminator) return STATUS_SUCCESS;
++#if defined(__x86_64__)
++    if ((ULONG_PTR)terminator >> 47)
++    {
++        static int lines;
++        char line[160];
++        int n;
++
++        if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) < 8)
++        {
++            n = snprintf( line, sizeof(line),
++                          "wine-ps5: ipv6-terminator ptr=%p str=%p caller=%p\n",
++                          (void *)terminator, (void *)at, caller );
++            if (n > 0)
++                __wine_dbg_write( line, (unsigned int)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1) );
++        }
++        return STATUS_ACCESS_VIOLATION;
++    }
++#else
++    (void)caller;
++#endif
++    *terminator = at;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS ipv6_string_to_address(const WCHAR *str, BOOL ex,
+-                                       const WCHAR **terminator, IN6_ADDR *address, ULONG *scope, USHORT *port)
++                                       const WCHAR **terminator, IN6_ADDR *address, ULONG *scope, USHORT *port,
++                                       void *ps5_caller)
+ {
+     BOOL expecting_port = FALSE, has_0x = FALSE, too_big = FALSE;
+     int n_bytes = 0, n_ipv4_bytes = 0, gap = -1;
+@@ -2220,7 +2255,7 @@ static NTSTATUS ipv6_string_to_address(const WCHAR *str, BOOL ex,
+             if (prev_str[0] == '0' && (prev_str[1] == 'x' || prev_str[1] == 'X'))
+             {
+                 /* Windows "feature": the last IPv6 component can start with "0x" and be longer than 4 digits */
+-                if (terminator) *terminator = prev_str + 1; /* Windows says that the "x" is the terminator */
++                if (ps5_store_terminator( terminator, prev_str + 1, ps5_caller )) return STATUS_ACCESS_VIOLATION; /* Windows says that the "x" is the terminator */
+                 if (n_bytes < 14 && gap == -1) return STATUS_INVALID_PARAMETER;
+                 address->u.Word[n_bytes/2] = htons(ip_component);
+                 n_bytes += 2;
+@@ -2240,7 +2275,7 @@ static NTSTATUS ipv6_string_to_address(const WCHAR *str, BOOL ex,
+         str++;
+     }
+ 
+-    if (terminator) *terminator = str;
++    if (ps5_store_terminator( terminator, str, ps5_caller )) return STATUS_ACCESS_VIOLATION;
+     if (too_big) return STATUS_INVALID_PARAMETER;
+ 
+ fill_gap:
+@@ -2286,7 +2321,7 @@ fill_gap:
+     return STATUS_SUCCESS;
+ 
+ error:
+-    if (terminator) *terminator = str;
++    if (ps5_store_terminator( terminator, str, ps5_caller )) return STATUS_ACCESS_VIOLATION;
+     return STATUS_INVALID_PARAMETER;
+ }
+ 
+@@ -2297,7 +2332,7 @@ NTSTATUS NTAPI RtlIpv6StringToAddressExW(const WCHAR *str, IN6_ADDR *address, UL
+ {
+     TRACE("(%s, %p, %p, %p)\n", debugstr_w(str), address, scope, port);
+     if (!str || !address || !scope || !port) return STATUS_INVALID_PARAMETER;
+-    return ipv6_string_to_address(str, TRUE, NULL, address, scope, port);
++    return ipv6_string_to_address(str, TRUE, NULL, address, scope, port, __builtin_return_address( 0 ));
+ }
+ 
+ /***********************************************************************
+@@ -2306,7 +2341,7 @@ NTSTATUS NTAPI RtlIpv6StringToAddressExW(const WCHAR *str, IN6_ADDR *address, UL
+ NTSTATUS WINAPI RtlIpv6StringToAddressW(const WCHAR *str, const WCHAR **terminator, IN6_ADDR *address)
+ {
+     TRACE("(%s, %p, %p)\n", debugstr_w(str), terminator, address);
+-    return ipv6_string_to_address(str, FALSE, terminator, address, NULL, NULL);
++    return ipv6_string_to_address(str, FALSE, terminator, address, NULL, NULL, __builtin_return_address( 0 ));
+ }
+ 
+ /***********************************************************************
