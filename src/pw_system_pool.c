@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "pw_system_pool.h"
+#include "pw_memory_guard.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,14 +26,15 @@ static int parse_u(const char *text, unsigned *out)
     return 1;
 }
 
-static int pool_eligible(int pid, int title_pid, int memory_pid)
+static int pool_eligible(int pid, int title_pid, int memory_pid, int shell_pid)
 {
-    return pid > 1 && pid != title_pid && (memory_pid <= 1 || pid != memory_pid);
+    return pid > 1 && pid != title_pid && (memory_pid <= 1 || pid != memory_pid) &&
+           (shell_pid <= 1 || pid != shell_pid);
 }
 
 int pw_system_pool_victim(const struct PwPoolCharge *rows, unsigned count, int largest_pid,
                           uint64_t largest_bytes, int newest_pid, uint64_t newest_bytes, int title_pid,
-                          int memory_pid)
+                          int memory_pid, int shell_pid)
 {
     int best_pid = 0, new_pid = 0;
     uint64_t best_bytes = 0, new_bytes = 0;
@@ -40,7 +42,7 @@ int pw_system_pool_victim(const struct PwPoolCharge *rows, unsigned count, int l
 
     if (rows) {
         for (i = 0; i < count; i++) {
-            if (!pool_eligible(rows[i].pid, title_pid, memory_pid)) continue;
+            if (!pool_eligible(rows[i].pid, title_pid, memory_pid, shell_pid)) continue;
             if (!best_pid || rows[i].bytes > best_bytes) {
                 best_pid = rows[i].pid;
                 best_bytes = rows[i].bytes;
@@ -51,11 +53,11 @@ int pw_system_pool_victim(const struct PwPoolCharge *rows, unsigned count, int l
             }
         }
     }
-    if (pool_eligible(largest_pid, title_pid, memory_pid) && (!best_pid || largest_bytes > best_bytes)) {
+    if (pool_eligible(largest_pid, title_pid, memory_pid, shell_pid) && (!best_pid || largest_bytes > best_bytes)) {
         best_pid = largest_pid;
         best_bytes = largest_bytes;
     }
-    if (!new_pid && pool_eligible(newest_pid, title_pid, memory_pid)) {
+    if (!new_pid && pool_eligible(newest_pid, title_pid, memory_pid, shell_pid)) {
         new_pid = newest_pid;
         new_bytes = newest_bytes;
     }
@@ -88,8 +90,10 @@ void pw_system_pool_choose(unsigned firmware_limit_mib, int guard_off, const str
     }
     if ((pool_set && !pool_on) || (!pool_set && guard_off)) out->off = 1;
 
-    warn = firmware_limit_mib > 150u ? firmware_limit_mib - 150u : firmware_limit_mib * 3u / 4u;
-    kill = firmware_limit_mib;
+    /* At or below the firmware limit, a normal desktop and a launcher stay running. The hard end is
+     * the flexible guard's end mark. A limit of 0 leaves both at 0 until a file or the environment sets them. */
+    warn = firmware_limit_mib;
+    kill = firmware_limit_mib ? firmware_limit_mib + PW_MEMORY_GUARD_END_MARGIN_MIB : 0;
     hold_s = 8u;
     release = 64u;
     spike = 32u;
@@ -123,10 +127,10 @@ void pw_system_pool_choose(unsigned firmware_limit_mib, int guard_off, const str
 
 int pw_system_pool_sample(struct PwSystemPool *pool, const struct PwSystemPoolConfig *config,
                           uint64_t system_bytes, uint64_t rise_bytes, uint64_t now_ms, int helper_pid,
-                          int title_pid, int *target)
+                          int title_pid, int shell_pid, int *target)
 {
     uint64_t warn, kill_at, spike, release, clear_at, near;
-    int eligible, hot, close, over;
+    int eligible, climbing, over;
 
     if (!pool || !config || !target) return EINVAL;
     *target = 0;
@@ -151,23 +155,18 @@ int pw_system_pool_sample(struct PwSystemPool *pool, const struct PwSystemPoolCo
         return PW_POOL_CLEAR;
     }
 
-    eligible = helper_pid > 1 && helper_pid != title_pid;
-    hot = rise_bytes >= spike && system_bytes >= warn;
-    close = rise_bytes > 0 && system_bytes >= near;
+    eligible = pool_eligible(helper_pid, title_pid, 0, shell_pid);
     over = system_bytes >= kill_at;
-    if (!hot && !close && !over) return PW_POOL_FINE;
+    /* Above the warn line and already within one spike of the hard end. At the warn line, and
+     * anywhere under it, a rise is the session's ordinary use. */
+    climbing = rise_bytes >= spike && system_bytes > warn && system_bytes >= near;
+    if (!climbing && !over) return PW_POOL_FINE;
 
     pool->episode = 1;
     if (pool->phase && now_ms < pool->phase_ms) return PW_POOL_FINE;
-    if (!eligible) {
-        if (!pool->phase) {
-            pool->phase = 1;
-            pool->phase_ms = now_ms;
-            return PW_POOL_WARN;
-        }
-        return PW_POOL_FINE;
-    }
-    /* Already paused. Still at the limit after the hold: the pause did not give the pages back. */
+    /* Already paused. Still at the hard end after the hold: the pause did not give the pages back.
+     * This runs before the eligibility check so a later sample whose only candidate is the desktop
+     * root still ends the helper that was paused. */
     if (pool->phase == 4) {
         if (over && now_ms >= pool->phase_ms && now_ms - pool->phase_ms >= (uint64_t)config->spike_hold_ms &&
             pool->stopped_pid > 1) {
@@ -176,11 +175,19 @@ int pw_system_pool_sample(struct PwSystemPool *pool, const struct PwSystemPoolCo
             *target = pool->stopped_pid;
             return PW_POOL_KILL;
         }
-        if (helper_pid != pool->stopped_pid) {
+        if (eligible && helper_pid != pool->stopped_pid) {
             pool->stopped_pid = helper_pid;
             pool->phase_ms = now_ms;
             *target = helper_pid;
             return PW_POOL_SUSPEND;
+        }
+        return PW_POOL_FINE;
+    }
+    if (!eligible) {
+        if (!pool->phase) {
+            pool->phase = 1;
+            pool->phase_ms = now_ms;
+            return PW_POOL_WARN;
         }
         return PW_POOL_FINE;
     }

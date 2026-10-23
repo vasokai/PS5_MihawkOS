@@ -843,6 +843,15 @@ int pw_ps5_root_present(void)
     pthread_mutex_unlock(&child_lock);
     return present;
 }
+int pw_ps5_root_pid(void)
+{
+    pid_t pid = 0;
+    pthread_mutex_lock(&child_lock);
+    for (unsigned i = 0; i < 32; ++i)
+        if (children[i].initial && children[i].service > 0) { pid = children[i].pid; break; }
+    pthread_mutex_unlock(&child_lock);
+    return (int)pid;
+}
 int pw_ps5_unload_root(void)
 {
     pid_t pid = 0;

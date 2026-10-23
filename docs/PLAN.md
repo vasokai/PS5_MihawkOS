@@ -1,6 +1,14 @@
 # Plan
 
+## Desktop paint presents when it ends, and the pool pauses only at the hard end (2026-10-23, no console run)
+
+The desktop's rubber band and icon hover blinked because patch 0640 flushes a GDI surface on the first unlock 16 ms after the previous flush. A desktop WM_PAINT is many GDI calls against one retained DIB, and the broker copies that DIB whole, so the TV showed the erase before the band or the icon was drawn. Patch 0641 holds the flush while the thread is inside BeginPaint and publishes that window at EndPaint. A thread that draws without BeginPaint, which is how a 24 fps cinematic presents, still flushes every 16 ms. Vulkan presents are untouched. Host test `pw_gdi_present`.
+
+The pool governor that paused the desktop (`guarded 1270 MiB` on the status line, `system pool pause`, and the notice that one Windows program was paused) watched the raw resident census with a warn line of 1450 MiB. An idle desktop's raw census is about 1460 MiB, so the first helper charge during boot was a rise already past the warn line, and explorer was SIGSTOPped before a frame. A launcher's raw census also climbs past 1600 MiB, and past 1800, while the guarded figure stays near the idle desktop and flexible memory stays free. The governor now watches that guarded figure. Firmware 12 warns at 1600 MiB and pauses only above that, within one 32 MiB spike of the hard end at 1670, or at 1670 itself. The title, the memory helper, and the desktop root are never signalled. The display watchdog's pressure mark stays the firmware limit (1600), not the new kill line. The prefix save before helper SIGKILL, the 30 s file sync, and direct-memory anonymous mappings are unchanged. Host test `pw_system_pool`. Not run on a console.
+
 ## Raw system-memory spikes, and a prefix saved before SIGKILL (2026-10-22, no console run)
+
+The governor's thresholds in this section are the ones the 2026-10-23 section above replaces. The prefix save stands.
 
 The flexible-pressure guard below is unchanged. Beside it, the title samples the raw resident census about every 200 ms
 (`src/pw_system_pool.h`) and adds helper growth since the memory helper's half-second census. A steady figure under the

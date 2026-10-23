@@ -111,6 +111,10 @@ Paired receiver probes reproduce the old cache failure and qualify the new
 behavior. The complete pinned replay currently passes **141/141 patches**;
 console code-commit qualification is tracked in the current PLAN gate record.
 
+### 0641: a paint is presented when it ends (2026-10-23)
+
+A desktop WM_PAINT is many GDI calls against one retained DIB. Patch 0640 flushes on the first unlock 16 ms after the last flush, so the broker shows the erase before the rubber band or the hovered icon is drawn, and the desktop blinks while the pointer moves. While BeginPaint has not reached EndPaint, an unlock does not flush. EndPaint publishes that window. A thread that draws without BeginPaint still flushes every 16 ms, which is the path a 24 fps cinematic needs. Vulkan presents are unchanged. Host test `pw_gdi_present`. No console run. The replay count above is the last full replay; 0641 is part of the series the builders apply in filename order.
+
 ### 1172: a thread suspended in a system call's return reports the call's context (2026-10-16)
 
 `__wine_syscall_dispatcher`'s return moves `%rsp` into the frame before it restores the program's registers, and from
