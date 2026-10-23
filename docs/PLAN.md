@@ -1,3 +1,25 @@
+## 36e5564 on the console: Play returns to Play (2026-10-23)
+
+The 19045 ntdll trio was installed and hash-checked: `ntdll.dll` `2f6d3c31…`, `ntdll.prx.elf` `ddcf4c90…`, `ntdll.prx` `87ed5b12…`. Battle.net stayed up. Clicking Play on WoW Classic beta showed Launching and returned to Play. No Blizzard error, and no Crash.txt for this ntdll. The bundle's `2026-10-23 11.58.45` Crash.txt is the previous image: its DBG-MODULE list puts `ntdll.dll` at `0xDFFFF40000` and the fault at `0xDFFFFA5903`.
+
+`WowB.exe` in session 0 is wine-child 578, 580, 581, 582 and 583. Each loads `ntdll.dll` at `0xDFFFD20000` and `kernelbase.dll` at `0xDFFFA00000`, then `WowB_loader.dll` at `0xDFFBB60000`. wine-child 584 was still in the HID setup when the log was copied. Each finished process prints the same five lines:
+
+`status 0xc0000024 syscall=NtSetIoCompletion id=0x1a3 caller=0xdfffd7725f handle=0xffffffffffffffff guest=0xdfffa3faea type=Process`
+
+with keys `0x100020dbb8`, `0x100020d6a8`, `0x100020e0c8`, `0x100020e698`, `0x100020e698`.
+
+The built `ntdll.dll` (`2f6d3c313f23698337051030e55cb1e9d249ef3bc62907df26bf01e5cda04e57`, the installed file) has 258 `Zw*` stubs and 258 `Nt*` stubs. Each pair shares one RVA. The stubs are contiguous from `0x55540` to `0x57560`, step `0x20`, and the `mov eax` immediates increase with the address. Rank `0` is `NtAccessCheck` (immediate `0`). Rank equals the immediate for the first 99 services, `0x00` through `0x62`. `NtAdjustGroupsToken` (immediate `0x6c`) sits at rank `0x63`. Rank `0xe8` is `NtSetIoCompletion` / `ZwSetIoCompletion`, immediate `0x1a3`, RVA `0x57240`. Rank `0xe9` is `NtSetIoCompletionEx` / `ZwSetIoCompletionEx`, immediate `0x1a4`, RVA `0x57260`. `NtFlushInstructionCache` is rank `0x93` (147), immediate `0xe9`, RVA `0x567a0`. Rank equals the immediate for 99 of 258 stubs.
+
+`caller=0xdfffd7725f` is `0xDFFFD20000+0x5725f`, the `ret` of the `NtSetIoCompletion` stub (`0x57240+0x1f`). `guest=0xdfffa3faea` is `0xDFFFA00000+0x3faea`. The kernelbase objects in this tree call `NtSetIoCompletion` from `PostQueuedCompletionStatus` only. In `sync.o` that `callq` returns at function+`0x61`. The previous run's guest was `0xdfffc5faea` with kernelbase at `0xDFFFC20000`, the same offset `0x3faea`, and its caller was ntdll+`0x5727f`, the `ret` of this same export when the immediate was `0xe9` and the RVA was `0x57260`. That RVA is now `NtSetIoCompletionEx`. The handle is `NtCurrentProcess()`, so `NtSetIoCompletion` returns `STATUS_OBJECT_TYPE_MISMATCH`. The five lines are that export. Execution continues after them: wallpaper, `uxtheme.dll`, then
+
+`fixme:threadpool:RtlSetIoCompletionCallback Unknown value Flags=0x24`
+
+`Flags=0x20d3a8` and `Flags=0x20dbd0`.
+
+The exit is the next line. In 578 it is `15153.507:08d0:08d4:err:seh:user_callback_handler ignoring exception c0000005` (581 at `15173.290`, 580 at `15169.413`, 582 at `15185.275`, 583 at `15203.968`). `user_callback_handler` is the SEH handler on `KiUserCallbackDispatcher`. It unwinds that frame and returns the exception code, so the access violation stays inside the callback and WoW's unhandled filter does not write Crash.txt. Four milliseconds later the log shows `wine-ps5: kill thread` (SIGQUIT from process teardown) interleaved with `errno_to_status` errno 85, which is `ECANCELED`, converted to `STATUS_UNSUCCESSFUL`. The thread count falls (`thread … killed, N left`). The last thread reaches `abort_process` → `pw_ps5_child_exit`, which stamps doom `reason=exit` (`PW_CHILD_DOOM_EXIT`). The helper then logs `payload terminal reason=control-ended` and ends. Battle.net leaves Launching because the process exited.
+
+The address-rank hypothesis for this line does not hold: rank `0xe9` is `NtSetIoCompletionEx`, and the instruction that ran is the `NtSetIoCompletion` export called from `kernelbase!PostQueuedCompletionStatus`. The stubs are already in ascending Windows SSN order. Rank equals SSN only while there is no hole, so an exact rank match for every implemented service would need a stub in each of the 216 holes. No dummy stubs were added, `tools/check-syscall-numbers.py` was not changed, and the ntdll trio was not rebuilt.
+
 ## x64 syscall numbers are Windows 10 build 19045 (2026-10-23, no console run)
 
 The installed tracer (ntdll pair `24743ffb…`, commit `b4d63f4`) logged `NtSetIoCompletion` at id `0xe9`, handle `-1`, type `Process`, guest `0xdfffc5faea`. This Wine reports 10.0.19045 (`dlls/ntdll/version.c`, the `WIN10` row). On x64 Windows 10 22H2 that id is `NtFlushInstructionCache`. `NtSetIoCompletion` is `0x1a3`. `NtWriteFile` is `0x8` and `NtDeviceIoControlFile` is `0x7` on both tables, so those thunks were left. The reported build stays 19045. `tests/test_pw_status_note.c` still expects the string `NtSetIoCompletion` and id `0xe9`.
