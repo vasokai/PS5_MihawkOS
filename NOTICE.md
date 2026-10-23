@@ -563,6 +563,16 @@ Never shipped: the distribution's `d3dcompiler_47.dll` (Microsoft's), `vulkan-1.
 `tools/fetch-cef.py` unpacks the first four into `.deps` only, for host experiments (docs/MIHAWK_BROWSER.md decision
 5); no build or stage step copies them.
 
+## Windows syscall numbers
+
+`tools/syscall-numbers/` holds three name-to-number maps used by `tools/check-syscall-numbers.py`:
+Windows 10 build 19045 (22H2) x64 ntoskrnl, the same build's x86 ntoskrnl, and the same build's x64
+win32k. They were taken on 2026-10-23 from the columns `Windows 10 (22H2)` of
+[j00ru/windows-syscalls](https://github.com/j00ru/windows-syscalls) `nt64.csv`, `nt32.csv` and
+`win32k64.csv`. That repository published no licence file on that date. The files here are the
+syscall name and its number, which is the Windows ABI for that build, and nothing else from the
+repository. They are the oracle for the host check. They are not linked into a title.
+
 ## Trademarks
 
 PlayStation, PS5 and DualSense are trademarks of Sony Interactive Entertainment Inc. Windows is a trademark of
