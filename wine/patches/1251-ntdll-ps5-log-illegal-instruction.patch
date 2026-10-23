@@ -1,0 +1,262 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: log an illegal instruction and emulate UMIP
+
+7f25807 was installed (ntdll.prx.elf 22a0f5c5, ntdll.prx 04c0dd6e) with
+ntdll.dll b2908d0c. WowB still wrote ILLEGAL_INSTRUCTION. Crash.txt
+14.57.56 and 14.58.02 have no instruction address. The wine logs show
+execute-fault at 0x1000445ad0 and 0x1000445b60 and no stack-overflow line,
+so patch 1250 did not run and its bytes= line never printed.
+
+Every SIGILL, and every exception about to be delivered as
+EXCEPTION_ILLEGAL_INSTRUCTION or EXCEPTION_PRIV_INSTRUCTION, writes one
+line, at most 16 a process, before KiUserExceptionDispatcher:
+
+wine-ps5: illegal-instruction sig=%d trap=%#llx err=%#llx si=%d code=%#x rip=%p %s bytes=%s emulated=%s
+
+bytes are 32 bytes at RIP, with the general registers. A vectored handler
+that then sees an illegal or privileged instruction writes
+wine-ps5: vectored-handler, at most 16 lines, with the handler and
+continue or search. An empty chain is one search line.
+
+SGDT, SIDT, SLDT, SMSW and STR are completed in the signal handler. On
+Linux the kernel does this before Wine sees a signal, and this tree had
+no emulate_* for them. The stored values are that kernel's: GDT base
+0xfffffffffffe0000, IDT base 0xffffffffffff0000, limits 0, SMSW
+0x80050033, SLDT 0, STR 0x40. #UD and #GP(0) both take the path. XGETBV,
+RDTSCP, CPUID, RDPID, IN/OUT and UD2 are not emulated; the log names
+their bytes. wine/ps5/pw_wine_umip.h, host test tests/test_pw_umip.c.
+Syscall numbers are unchanged. No console run.
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index d74d477..4e3f400 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -1954,6 +1954,125 @@
+         rbp = next;
+     }
+ }
++
++#include "pw_wine_umip.h"
++
++/* One line, at most 16 a process, before KiUserExceptionDispatcher. bytes are the
++ * 32 bytes at RIP. emulated is sgdt/sidt/smsw/sldt/str when the instruction was
++ * completed here, and no when the exception is about to be delivered. */
++static void ps5_log_illegal( int signal, siginfo_t *info, ucontext_t *ctx, DWORD code, const char *emulated )
++{
++    static int lines;
++    BYTE bytes[32];
++    char hex[72], where[80], line[1280];
++    unsigned int i, n, pos;
++    int wrote;
++
++    if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) >= 16) return;
++    n = (unsigned int)virtual_uninterrupted_read_memory( (void *)RIP_sig(ctx), bytes, sizeof(bytes) );
++    pos = 0;
++    hex[0] = 0;
++    for (i = 0; i < n && i < sizeof(bytes); i++)
++    {
++        wrote = snprintf( hex + pos, sizeof(hex) - pos, "%02x", bytes[i] );
++        if (wrote < 0 || (unsigned int)wrote >= sizeof(hex) - pos) break;
++        pos += wrote;
++    }
++    ps5_module_of( (ULONG_PTR)RIP_sig(ctx), where, sizeof(where) );
++    snprintf( line, sizeof(line),
++              "wine-ps5: illegal-instruction sig=%d trap=%#llx err=%#llx si=%d code=%#x rip=%p %s bytes=%s emulated=%s "
++              "rax=%#llx rcx=%#llx rdx=%#llx rbx=%#llx rsi=%#llx rdi=%#llx rbp=%#llx rsp=%#llx "
++              "r8=%#llx r9=%#llx r10=%#llx r11=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
++              signal, (unsigned long long)TRAP_sig(ctx), (unsigned long long)ERROR_sig(ctx),
++              info ? info->si_code : 0, (unsigned int)code, (void *)RIP_sig(ctx), where, hex,
++              emulated ? emulated : "no",
++              (unsigned long long)RAX_sig(ctx), (unsigned long long)RCX_sig(ctx),
++              (unsigned long long)RDX_sig(ctx), (unsigned long long)RBX_sig(ctx),
++              (unsigned long long)RSI_sig(ctx), (unsigned long long)RDI_sig(ctx),
++              (unsigned long long)RBP_sig(ctx), (unsigned long long)RSP_sig(ctx),
++              (unsigned long long)R8_sig(ctx), (unsigned long long)R9_sig(ctx),
++              (unsigned long long)R10_sig(ctx), (unsigned long long)R11_sig(ctx),
++              (unsigned long long)R12_sig(ctx), (unsigned long long)R13_sig(ctx),
++              (unsigned long long)R14_sig(ctx), (unsigned long long)R15_sig(ctx) );
++    ps5_log_line( line );
++}
++
++static unsigned long long *ps5_sig_reg( ucontext_t *ctx, unsigned int reg )
++{
++    switch (reg)
++    {
++    case 0: return (unsigned long long *)&RAX_sig(ctx);
++    case 1: return (unsigned long long *)&RCX_sig(ctx);
++    case 2: return (unsigned long long *)&RDX_sig(ctx);
++    case 3: return (unsigned long long *)&RBX_sig(ctx);
++    case 4: return (unsigned long long *)&RSP_sig(ctx);
++    case 5: return (unsigned long long *)&RBP_sig(ctx);
++    case 6: return (unsigned long long *)&RSI_sig(ctx);
++    case 7: return (unsigned long long *)&RDI_sig(ctx);
++    case 8: return (unsigned long long *)&R8_sig(ctx);
++    case 9: return (unsigned long long *)&R9_sig(ctx);
++    case 10: return (unsigned long long *)&R10_sig(ctx);
++    case 11: return (unsigned long long *)&R11_sig(ctx);
++    case 12: return (unsigned long long *)&R12_sig(ctx);
++    case 13: return (unsigned long long *)&R13_sig(ctx);
++    case 14: return (unsigned long long *)&R14_sig(ctx);
++    default: return (unsigned long long *)&R15_sig(ctx);
++    }
++}
++
++/* Complete SGDT/SIDT/SLDT/SMSW/STR. Linux does this in the kernel, so Wine there
++ * never sees the fault. A hypervisor that raises #UD or #GP(0) instead is handled
++ * here. Anything else, including XGETBV, RDTSCP, CPUID and UD2, is left to the log. */
++static BOOL ps5_try_umip( ucontext_t *ctx, siginfo_t *info, int signal )
++{
++    unsigned long long trap, err, regs[16], addr, value;
++    unsigned long long *slot;
++    BYTE raw[16];
++    struct pw_umip_insn insn;
++    unsigned int n, i;
++    void *base;
++
++    trap = (unsigned long long)TRAP_sig(ctx);
++    err = (unsigned long long)ERROR_sig(ctx);
++    if (!(signal == SIGILL || trap == TRAP_x86_PRIVINFLT ||
++          ((signal == SIGSEGV || signal == SIGBUS) && trap == TRAP_x86_PROTFLT && !err)))
++        return FALSE;
++    n = (unsigned int)virtual_uninterrupted_read_memory( (void *)RIP_sig(ctx), raw, sizeof(raw) );
++    if (!pw_umip_decode( raw, n, CS_sig(ctx) == cs64_sel, &insn )) return FALSE;
++    if (insn.mem)
++    {
++        for (i = 0; i < 16; i++) regs[i] = *ps5_sig_reg( ctx, i );
++        addr = pw_umip_address( &insn, regs, (unsigned long long)RIP_sig(ctx) );
++        if (insn.seg)
++        {
++            base = NULL;
++            if (insn.seg == PW_UMIP_SEG_FS)
++            {
++                if (amd64_get_fsbase( &base )) return FALSE;
++            }
++            else if (amd64_get_gsbase( &base )) return FALSE;
++            addr += (ULONG_PTR)base;
++        }
++        if (virtual_uninterrupted_write_memory( (void *)addr, insn.data, insn.size ))
++        {
++            ps5_log_illegal( signal, info, ctx, 0, "write-failed" );
++            return FALSE;
++        }
++    }
++    else
++    {
++        slot = ps5_sig_reg( ctx, insn.reg );
++        value = 0;
++        memcpy( &value, insn.data, insn.size <= 8 ? insn.size : 8 );
++        if (insn.size == 2) *slot = (*slot & ~0xffffULL) | (value & 0xffffULL);
++        else if (insn.size == 4 || insn.zext) *slot = value & 0xffffffffULL;
++        else *slot = value;
++    }
++    ps5_log_illegal( signal, info, ctx, 0, pw_umip_name( insn.op ) );
++    RIP_sig(ctx) += insn.length;
++    leave_handler( ctx );
++    return TRUE;
++}
+ #endif
+ 
+ 
+@@ -3254,6 +3373,8 @@
+ 
+ #ifdef __PROSPERO__
+     if (ps5_mmu4k_signal( signal, siginfo, ucontext )) return;
++    /* UMIP instructions are completed here. The log names any other SIGILL. */
++    if (ps5_try_umip( ucontext, siginfo, signal )) return;
+ #endif
+     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
+     save_context( &context, ucontext );
+@@ -3345,6 +3466,11 @@
+         break;
+     }
+     if (handle_syscall_fault( ucontext, &rec, &context.c )) return;
++#ifdef __PROSPERO__
++    if (signal == SIGILL || rec.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION ||
++        rec.ExceptionCode == EXCEPTION_PRIV_INSTRUCTION)
++        ps5_log_illegal( signal, siginfo, ucontext, rec.ExceptionCode, "no" );
++#endif
+     setup_raise_exception( ucontext, &rec, &context );
+ }
+ 
+diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
+index 8e2780f..60afbcb 100644
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -144,6 +144,10 @@
+ }
+ 
+ 
++#ifdef __x86_64__
++static void ps5_log_vectored( EXCEPTION_RECORD *rec, void *func, LONG ret );
++#endif
++
+ /**********************************************************************
+  *           call_vectored_handlers
+  *
+@@ -156,6 +160,9 @@
+     PVECTORED_EXCEPTION_HANDLER func;
+     VECTORED_HANDLER *handler, *to_free = NULL;
+     PLIST_ENTRY mark, entry;
++#ifdef __x86_64__
++    int called = 0;
++#endif
+ 
+     except_ptrs.ExceptionRecord = rec;
+     except_ptrs.ContextRecord = context;
+@@ -177,6 +184,10 @@
+                func, rec->ExceptionCode, rec->ExceptionFlags );
+         ret = func( &except_ptrs );
+         TRACE( "handler at %p returned %lx\n", func, ret );
++#ifdef __x86_64__
++        called++;
++        ps5_log_vectored( rec, (void *)func, ret );
++#endif
+ 
+         RtlEnterCriticalSection( &vectored_handlers_section );
+         entry = entry->Flink;
+@@ -189,6 +200,9 @@
+     }
+     RtlLeaveCriticalSection( &vectored_handlers_section );
+     RtlFreeHeap( GetProcessHeap(), 0, to_free );
++#ifdef __x86_64__
++    if (!called) ps5_log_vectored( rec, NULL, ret );
++#endif
+     return ret;
+ }
+ 
+@@ -360,6 +374,35 @@
+     __ENDTRY
+ }
+ 
++/* An illegal or privileged instruction that reached a vectored handler. At most
++ * 16 lines a process. An empty chain is one line with handler 0 and result search. */
++static void ps5_log_vectored( EXCEPTION_RECORD *rec, void *func, LONG ret )
++{
++    static int lines;
++    char line[320], where[80], handler[80];
++    const char *result;
++
++    if (!rec) return;
++    if (rec->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION &&
++        rec->ExceptionCode != STATUS_PRIVILEGED_INSTRUCTION)
++        return;
++    if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) >= 16) return;
++    if (ret == EXCEPTION_CONTINUE_EXECUTION) result = "continue";
++    else if (ret == EXCEPTION_CONTINUE_SEARCH) result = "search";
++    else result = "other";
++    ps5_pe_module( (ULONG_PTR)rec->ExceptionAddress, where, sizeof(where) );
++    if (func) ps5_pe_module( (ULONG_PTR)func, handler, sizeof(handler) );
++    else
++    {
++        handler[0] = '-';
++        handler[1] = 0;
++    }
++    snprintf( line, sizeof(line),
++              "wine-ps5: vectored-handler code=%#lx rip=%s handler=%p %s result=%s\n",
++              rec->ExceptionCode, where, func, handler, result );
++    __wine_dbg_write( line, (unsigned int)strlen( line ) );
++}
++
+ /* KiUserCallbackDispatcher's establisher frame is its RSP, the callback_stack_layout.
+  * id is at +0x2c, the unix return address at +0x30. A frame that fails these checks
+  * leaves the id unknown; the TEB slots below are the ones KeUserModeCallback wrote. */

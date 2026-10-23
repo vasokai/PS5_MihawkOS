@@ -1,3 +1,25 @@
+## Illegal instruction still unnamed (2026-10-23, no console run)
+
+7f25807 was installed (`ntdll.prx.elf` `22a0f5c5`, `ntdll.prx` `04c0dd6e`) with `ntdll.dll` `b2908d0c`. Crash.txt `_classic_beta_` `14.57.56` and `14.58.02` are again `ILLEGAL_INSTRUCTION` and the module list. Neither file has an instruction address, registers or a stack. The hash block is `DBG-OPTIONS FunctionsOnly` and then empty. `memory.dmp` is not in the bundle, and `WowB_loader.dll` is not either, so the opcode bytes are not in this record. ntdll in that list is still base `0xDFFFD10000` size `0x2d5000`, timestamp 1792755850, the `b2908d0c` image.
+
+wine-child 819 logs `execute-fault addr=1000445ad0 vprot=0x23 view=0x3` and then the title's `kill thread`. wine-child 821 logs `execute-fault addr=1000445b60` and the same kill. Neither log has `ps5_open_last_stack_page` or `stack overflow`. Patch 1250 only runs when the exception frame sits in the bottom host page. This frame fit, the exception was delivered, and WoW wrote the report. The exit tally is again `conversions=1068` `convert_failed=0` `exec_refused=0`.
+
+`dlls/ntdll/unix/signal_x86_64.c` in this tree has no `emulate_*` for SGDT, SIDT, SLDT, SMSW or STR. Current Wine does not either. On Linux the kernel's UMIP handler stores dummy values and Wine never sees the fault. A Zen 2 with UMIP and no kernel emulation raises `#GP(0)` or, if the hypervisor reports it that way, `#UD`. Patch 1251 completes those five instructions on `#UD` and on `#GP(0)`. The values are the Linux ones: GDT base `0xfffffffffffe0000`, IDT base `0xffffffffffff0000`, both limits 0, SMSW `0x80050033`, SLDT 0, STR `0x40`. XGETBV, RDTSCP, CPUID, RDPID, IN/OUT and UD2 are not emulated. CPUID and XGETBV stay the real instructions in `init_shared_data_cpuinfo`.
+
+Before `KiUserExceptionDispatcher`, every SIGILL and every exception about to be delivered as `EXCEPTION_ILLEGAL_INSTRUCTION` or `EXCEPTION_PRIV_INSTRUCTION` writes one line, at most 16 a process: `wine-ps5: illegal-instruction` with the signal, trap, error code, `si_code`, exception code, RIP, module and offset, 32 instruction bytes, `emulated=` and the general registers. An emulated UMIP instruction is the same line with `emulated=sgdt` (or `sidt`, `smsw`, `sldt`, `str`) and is not delivered. A vectored handler that then sees an illegal or privileged instruction writes `wine-ps5: vectored-handler` with the handler address and `continue` or `search`, at most 16 lines. An empty chain is one `search` line. That second line is in the PE `ntdll.dll`.
+
+Syscall numbers stay the 19045 table. The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The protocol dword `a3 03 00 00` still occurs 26 times in the shared ELF, and `81 fe a3 03 00 00` once. `SizeOfImage` stays `0x2d5000`. The DLL file stays 3,211,264 bytes and its hash changed, because the vectored-handler line is in that image. This was not run on a console. The illegal instruction is not claimed gone. The next run's `illegal-instruction` line is what shows the opcode bytes.
+
+Install the new unix files with the new `ntdll.dll`. wineserver was not rebuilt.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `63b7dab8c8e872cb375a0d051c5b8eb97ec744e88f31a0ea229c1f6e7f1bd3e4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,421,892 | `0ff63726c7dbd6fdf7658625fabde3d7a11d42d4bd2c1f829423b427ee5dbcb1` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,212,914 | `88d9951545f2bd604a2b5b97704ccc348943594a50e34f8a11e6e0705967d30b` |
+
+The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,864,648 bytes, `b3a6577751b3eed15bc6696d681c0781e9779f974ccfbd1bc4e7b28d3ecfeed0`.
+
 ## Illegal instruction after the private execute fault (2026-10-23, no console run)
 
 e019bd8 was installed (`ntdll.prx.elf` `7afcdeaf`, `ntdll.prx` `728c1d98`) with `ntdll.dll` `b2908d0c`. The blank dashboard in the previous section cleared after a restart: this session's title log shows the stall and then 358, 591, 300 and 362 frames in 10 s before WowB. No dashboard change was built.
