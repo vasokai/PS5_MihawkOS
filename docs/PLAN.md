@@ -10,6 +10,14 @@ cannot be byte-checked. The unlocked vm_map write this tree already disabled rac
 period were followed by two factory resets. [DMEM_EXEC.md](DMEM_EXEC.md) is the decision, the firmware words, and the
 rule for a later probe. No new eboot. Nothing to deploy.
 
+## Budget 0's 8 GiB reading is an accounting cap (2026-10-23, no console run)
+
+PS5LM's payload probe on a Slim at firmware 13.60 reports 8.00 GiB of flexible memory configured and 7.97 GiB free, and
+direct memory of size 0. The published page records 13.60. Mihawk's helpers already stay on budget 0. The 1600 MiB line
+is the resident census this tree guards. The 8 GiB figure is the accounting cap on another counter. Holding about 6 GiB
+of the payload pool froze PS5LM's home screen until the process ended; locking 2.7 GiB froze the console.
+[DMEM_EXEC.md](DMEM_EXEC.md) ranks the routes and leaves one read-only probe. No kernel byte is written. Nothing to deploy.
+
 ## Raw system-memory spikes, and a prefix saved before SIGKILL (2026-10-22, no console run)
 
 The flexible-pressure guard below is unchanged. Beside it, the title samples the raw resident census about every 200 ms
