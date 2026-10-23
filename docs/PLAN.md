@@ -1,3 +1,7 @@
+## Forever Wine is not a drop-in runtime (2026-10-23, no build, no console run)
+
+bizkut/ps5-forever-wine `ee64b784` is LGPL-2.1-or-later. Its loader `dlopen`s `ntdll.so` and requires `wine_ps5_title_runtime` version 12. Mihawk loads `ntdll.prx` through `PRXDESC1` and `PW_CHILD_PROTOCOL` `0x50573511`. Forever's ntdll has no `pw_wine_` export. Server protocol is 930 there and 931 here. Sonames are compiled as absolute paths under `/data/homebrew/PPSA99030/wine`. A second folder beside `ge11-7` is a safe revert only while the title does not open it. The build was not started: the objects would not load on the current boot path. The comparison is [`docs/FOREVER_RUNTIME.md`](FOREVER_RUNTIME.md).
+
 ## PostQueuedCompletionStatus read after the 1260 dispatcher (2026-10-23)
 
 1260 was installed (`ntdll.prx.elf` `49a47bde`, `ntdll.prx` `97adf90d`, dll `63b7dab8`). 35 processes log `syscall-dispatch ... path=call addr=0x7ffe4000 ready=1`. There is no `path=int2e`. wine-child 138 logs `wow-loader image=WoWClassic.exe recognized=1` twice. The old three faults are absent: no `ntdll+0x5834b` `#GP`, no `kernelbase+0x3f498` write, no `WowClassic_loader+0x1c9d710` null write. Play still returns to Play. Battle.net, process 138, stays the foreground presenter (74 to 387 frames in each 10 s through title second 100).
