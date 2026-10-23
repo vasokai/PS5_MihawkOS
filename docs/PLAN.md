@@ -1,3 +1,28 @@
+## Stock GE-Proton thunk tail (2026-10-23, no console run)
+
+2ae9d8c's helper pair was installed (`7cfe10a5` / `ce8eb14f`). The target is WoW Classic Era (`_classic_era_/WoWClassic.exe`, `WowClassic_loader.dll`). The `unimplemented function win32u.NtDComposition...` abort is gone: wine-child 395, 396 and 397 log none of those lines. Each process is still in the seconds=30 census. There is no window, no Crash.txt and no `killed` line. The title keeps presenting Battle.net (foreground process 384), so the 45000 ms hang breaker does not fire. The launcher's return to Play is Battle.net's own UI while those three Wine processes are still up. This build does not claim that return is gone.
+
+The three faults are the same in each child. They are not a race that undoes the loader. wine-child 395 writes `syscall-arm` with `path=call` (258 syscall, 0 int 2e), then `handlers=ready`, then `syscall-int2e ntdll armed=258` (the tail rewrite), and only later `image-writecopy` at `ntdll+0x58340`.
+
+Fault 1 is the failure. trap 9, error 0, pc `ntdll+0x5834b`, read fault `0xffffffffffffffff`. The live bytes are the previous thunk's Win10 nop, then `5c 24 30 ba 00 04 00 00 48 89 d9`, then the original displacement `08 03 fe 7f` and `cd 2e`. Those 11 bytes are `lea rbx, [rsp+0x30]; mov edx, 0x400; mov rcx, rbx` without the `48 8d` prefix. From `0x58340` that executes `pop rsp`, `and al, 0x30`, `mov edx, 0x400`, `mov rcx, rbx`, and at the pc `or byte [rbx], al`. `rbx` is non-canonical, so this is `#GP(0)`. `rsp` after `pop rsp` is `0xdfffa2faea`, the return address of `PostQueuedCompletionStatus` (`kernelbase+0x3faea`). It is not 8-aligned and it is outside the thread stack. `virtual_setup_exception` does not switch to that stack, and the backtrace is `-`. `ps5_repair_patched_stub` matches `5c 8b d1` plus `call [0x7ffe1000]`, and only after the dispatcher is entered. This `#GP` is before `int 2e`. The four `NtSetIoCompletion` returns of `0xC0000024` (handle -1, type Process) are the Windows mismatch. That status is unchanged.
+
+Stock GE-Proton 11-7, the same Wine pin, keeps `eb 01` and `call [0x7ffe1000]`. ps5-forever keeps that tail too and does not rewrite it to `cd 2e`. Its extra byte change is the dispatcher slot `0x7ffe4000`. This tree already stores the pointer at `0x7ffe1000` (patch 0530), and `path=call` is the path startup already ran. The rewrite is the byte change that made the loader's 11-byte store execute as `pop rsp`.
+
+Fault 2 is trap 12, error 6, pc `kernelbase+0x3f498`, write `0x103e256806`. The bytes are `or byte [rdx+0x3ba070b6], cl` with `rdx=0x100284f750`. `rsp` is inside the thread stack. The code page vprot is `0x2d` (write-copy, committed, execute, read), so the instruction is the file's. It is not the smashed-rsp failure.
+
+Fault 3 is trap 12, error 6. The log's pcview is `WowClassic_loader.dll+0x1c9d710`, write `0x8`. The bytes are `48 89 51 08` (`mov [rcx+8], rdx`) with `rcx=0`. `rsp` is inside the thread stack. It is a null store after faults 1 and 2. The loader is not patched. The load line's base and this pcview's base differ by `0x10000`, so that offset is the log's pcview, not a file RVA asserted here.
+
+`ps5_enable_windows_thunks` is gone. `ps5_keep_stock_thunks` runs after `handlers=ready`, counts the file tail against the Win10 tail, and does not store. The line is `wine-ps5: syscall-thunk ntdll wine=%u win10=%u systemcall=%#x path=call tail=eb01+call sample=%s`. `SystemCall` bit 0 stays set, so `jne +3` does not execute `0f 05`. `int 2e` is still emulated if a stub executes it. The `5c 8b d1` repair stays. The PE was not rebuilt: 3,211,264 bytes, `63b7dab8c8e872cb375a0d051c5b8eb97ec744e88f31a0ea229c1f6e7f1bd3e4`. `NtSetIoCompletion` at RVA `0x58340` is the 32-byte GE-Proton stub. The file holds 258 of those tails and 0 `cd 2e` tails. wineserver, win32u and the 32-bit ntdll and wow64 images were not rebuilt.
+
+The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The compare of protocol `0x3a3` is still `81 fe a3 03 00 00` at VA `0x35f70`. `movl $0x3a3, %edx` is still `ba a3 03 00 00` at VA `0x36284`. The `je` is now `0f 84 a3 03 00 00` at VA `0x918b3`. It was `0x91a33` in the 1258 image. There is no compare of `0x3a2`. The shared ELF holds the dword `a3 03 00 00` 42 times, in the same sections as 1258: `.text` 3, `.debug_loc` 18, `.debug_info` 13, `.debug_ranges` 4, `.debug_aranges` 1, `.debug_line` 1, `.dynsym` 1, `.symtab` 1. `NEEDED` is `libSceLibcInternal.prx` and `libkernel.prx`. `SONAME` is `ntdll.prx`. The installable module ELF has no section headers. Those two immediates and the `je` are at the same VAs in its first load segment. `tests/test_ntdll_stock_thunk.py` exits 0. No console run.
+
+Install these two files. Leave `ntdll.dll` (`63b7dab8`), the OpenGL win32u pair (`22f62466` / `d4d8cfc8`) and the helper pair (`7cfe10a5` / `ce8eb14f`).
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,438,628 | `801c6a0499f20d2fb87dab258d1242c0a10803fdc7aeb78bcaccecca19271d4c` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,229,858 | `8b74844f7a78eea9b4b77770def8fa9f347e3a33f4575e12e0a736a35625551e` |
+
 ## Helper win32u stubs patched in place (2026-10-23, no console run)
 
 88d2f79's OpenGL pair was installed (`22f62466` / `d4d8cfc8`, sizes checked on the console). Classic Era `WoWClassic.exe` (`_classic_era_`, `-launcherlogin`) still aborted nine times, three threads in each of wine-child 244, 245 and 246:
