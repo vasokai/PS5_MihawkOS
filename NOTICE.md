@@ -26,6 +26,25 @@ LGPL-2.1-or-later and is the origin of the PS5 platform work this project builds
   XInput mapping, the `/data` mount and the one-game-per-process launcher — comes from
   its `docs/WINE_PS5_BUILD.md` and `docs/ARCHITECTURE.md`.
 
+## Syscall dispatcher page and WoW loader name
+
+[ps5-forever](https://github.com/bizkut/ps5-forever) (bizkut, GPL-3.0-or-later) pins
+[ps5-forever-wine](https://github.com/bizkut/ps5-forever-wine) at
+`ee64b784239b73f4ff7aa30adc8b3dcd1966ded0` (`ps5/release/deps.json`, content
+SHA-256 `d465aa69e0625f57591634e1a0ffe753c329d13f1f7c089b2d39dafd12761453`,
+describe `wine-8.0-21023-forever-01.000.021`). That Wine tree is
+LGPL-2.1-or-later. Patch 1260 takes two pieces from it:
+
+- `include/wine/asm.h` names the x64 syscall dispatcher `0x7ffe4000` when
+  `__WINE_PS5__` or `__PROSPERO__` is set, and `dlls/ntdll/unix/signal_x86_64.c`
+  maps that host page. The thunk keeps Wine's `0f 05` and `jmp`. It does not
+  use `int 2e`.
+- `wine_ps5_title_game_image` recognizes a drive-qualified `Wow*.exe` by a
+  sibling `<stem>_loader.dll`, then a lowercase basename. The copy in
+  `wine/ps5/pw_wow_loader.h` is GPL-3.0-or-later with the rest of `wine/ps5`.
+  This tree has no `game_launch` callback, so process creation logs the match
+  and continues the helper spawn.
+
 The runtime adapters are pinned to upstream revision
 `c8a2f00137fb0a95f88541252b4e47f53f9677e6`; `wine/ps5/pw_ws2_32_libc.c` and
 `tests/test_pw_ws2_32_libc.c` were taken again at `d1ca1e597648f28e1f1d9c55f7d7ba9b1f0a0690` (prospero-win's
