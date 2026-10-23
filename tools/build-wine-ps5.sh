@@ -437,7 +437,7 @@ done
 # Wine's makedep resolves unlisted headers beside the including source, independently
 # of compiler CFLAGS. Install the repository-owned interface headers as build
 # inputs; implementation stays in wine/ps5, never edited in the vendor tree.
-for header in pw_wine_section.h pw_wine_section_ps5.h pw_wine_alias.h pw_wine_mmu4k.h pw_wine_file_query.h pw_wine_fdv.h pw_wine_status.h pw_wine_umip.h pw_wow_loader.h; do
+for header in pw_wine_section.h pw_wine_section_ps5.h pw_wine_alias.h pw_wine_mmu4k.h pw_wine_file_query.h pw_wine_fdv.h pw_wine_status.h pw_wine_umip.h pw_wine_gp.h pw_wow_loader.h; do
     cp -p "$root/wine/ps5/$header" "$tree/dlls/ntdll/unix/$header"
 done
 # Patch 1259: win32u/syscall.c includes the DirectComposition stub decision.

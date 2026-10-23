@@ -44,6 +44,10 @@ LGPL-2.1-or-later. Patch 1260 takes two pieces from it:
   `wine/ps5/pw_wow_loader.h` is GPL-3.0-or-later with the rest of `wine/ps5`.
   This tree has no `game_launch` callback, so process creation logs the match
   and continues the helper spawn.
+- Patch 1262 takes `SfcIsFileProtected` from commit `30a046a245c2` in that
+  Wine tree. The stub returns `FALSE` and does not call `SetLastError` or the
+  debug helpers. `SfcIsKeyProtected` no longer formats its arguments with
+  `debugstr_w`. Patch 1261's `#GP(0)` memory-operand decoder is local.
 
 The runtime adapters are pinned to upstream revision
 `c8a2f00137fb0a95f88541252b4e47f53f9677e6`; `wine/ps5/pw_ws2_32_libc.c` and
