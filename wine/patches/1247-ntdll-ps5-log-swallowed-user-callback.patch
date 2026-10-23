@@ -1,0 +1,754 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: log the exception a user callback swallows
+
+KiUserCallbackDispatcher catches every exception in user_callback_handler,
+unwinds, and returns the code. The c0000005 after uxtheme therefore never
+reaches WoW's unhandled filter, and that process writes no Crash.txt.
+
+The PE handler and the Unix signal path now write the EXCEPTION_RECORD, the
+KernelCallbackTable id, the faulting module and offset, the registers and
+sixteen guest stack words. WINE_PS5_CB_NOSWALLOW=1, or
+HKCU\Software\Wine\PS5 CallbackNoSwallow=1, skips the unwind so the
+exception propagates. The default is still the unwind. Syscall numbers are
+unchanged.
+
+No console run.
+---
+diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
+index 3b524d0..8e2780f 100644
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -23,6 +23,8 @@
+ #include <errno.h>
+ #include <signal.h>
+ #include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -276,6 +278,407 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
+ }
+ 
+ 
++#if defined(__x86_64__)
++
++/* WINE_PS5_CB_NOSWALLOW=1, or HKCU\Software\Wine\PS5 CallbackNoSwallow=1.
++ * Read once at process start. The handler only looks at this flag: opening
++ * the registry from KiUserCallbackDispatcher runs inside a server request. */
++static int ps5_noswallow;
++
++extern int WINAPI __wine_dbg_write( const char *str, unsigned int len );
++
++/* user32's KernelCallbackTable, in the order of include/ntuser.h ALL_USER32_CALLBACKS.
++ * win32u enters every one of these through KeUserModeCallback. Id 0 is valid. */
++static const char *ps5_callback_name( unsigned int id )
++{
++    static const char *const names[] =
++    {
++        "CallDispatchCallback", "CallEnumDisplayMonitor", "CallSendAsyncCallback",
++        "CallWinEventHook", "CallWinProc", "CallWindowsHook", "CopyImage",
++        "DrawNonClientButton", "DrawScrollBar", "DrawText", "FreeCachedClipboardData",
++        "ImmProcessKey", "ImmTranslateMessage", "InitBuiltinClasses", "LoadDriver",
++        "LoadImage", "LoadSysMenu", "PostDDEMessage", "RenderSynthesizedFormat",
++        "UnpackDDEMessage", "DragDropEnter", "DragDropLeave", "DragDropDrag",
++        "DragDropDrop", "DragDropPost",
++    };
++    return id < ARRAY_SIZE(names) ? names[id] : "?";
++}
++
++static int ps5_pe_line( const char *line )
++{
++    static int lines;
++
++    if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) >= 64) return 0;
++    __wine_dbg_write( line, (unsigned int)strlen( line ) );
++    return 1;
++}
++
++/* Name and offset of a guest address, from the PEB loader list. A bad link stops the walk.
++ * RtlPcToFileHeader takes the loader lock; this does not. */
++static void ps5_pe_module( ULONG_PTR addr, char *out, size_t n )
++{
++    snprintf( out, n, "%#llx", (unsigned long long)addr );
++    if (!addr || !NtCurrentTeb()->Peb || !NtCurrentTeb()->Peb->LdrData) return;
++    __TRY
++    {
++        PEB_LDR_DATA *ldr = NtCurrentTeb()->Peb->LdrData;
++        LIST_ENTRY *head = &ldr->InMemoryOrderModuleList;
++        LIST_ENTRY *link = head->Flink;
++        int i;
++
++        for (i = 0; i < 512 && link && link != head; i++)
++        {
++            LDR_DATA_TABLE_ENTRY *entry = CONTAINING_RECORD( link, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks );
++            unsigned int k, chars;
++            WCHAR wname[24];
++            char name[24];
++
++            if (entry->DllBase && entry->SizeOfImage &&
++                addr >= (ULONG_PTR)entry->DllBase &&
++                addr - (ULONG_PTR)entry->DllBase < entry->SizeOfImage)
++            {
++                chars = entry->BaseDllName.Length / sizeof(WCHAR);
++                if (chars > 23) chars = 23;
++                if (chars && entry->BaseDllName.Buffer)
++                {
++                    memcpy( wname, entry->BaseDllName.Buffer, chars * sizeof(WCHAR) );
++                    for (k = 0; k < chars; k++)
++                        name[k] = (wname[k] >= 32 && wname[k] < 127) ? (char)wname[k] : '?';
++                    name[chars] = 0;
++                }
++                else name[0] = 0;
++                snprintf( out, n, "%s+%#llx", name[0] ? name : "?",
++                          (unsigned long long)(addr - (ULONG_PTR)entry->DllBase) );
++                break;
++            }
++            link = link->Flink;
++        }
++    }
++    __EXCEPT_ALL
++    {
++    }
++    __ENDTRY
++}
++
++/* KiUserCallbackDispatcher's establisher frame is its RSP, the callback_stack_layout.
++ * id is at +0x2c, the unix return address at +0x30. A frame that fails these checks
++ * leaves the id unknown; the TEB slots below are the ones KeUserModeCallback wrote. */
++static int ps5_pe_frame( void *frame, ULONG *id, void **args, ULONG *len, ULONG64 *caller_rip )
++{
++    ULONG_PTR addr = (ULONG_PTR)frame;
++    ULONG_PTR limit = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
++    ULONG_PTR base = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
++    int ok = 0;
++
++    *id = ~0u;
++    *args = NULL;
++    *len = 0;
++    *caller_rip = 0;
++    if ((addr & 7) || addr < limit || addr + 0x38 > base) return 0;
++    __TRY
++    {
++        *args = *(void **)(addr + 0x20);
++        *len = *(ULONG *)(addr + 0x28);
++        *id = *(ULONG *)(addr + 0x2c);
++        *caller_rip = *(ULONG64 *)(addr + 0x30);
++        ok = 1;
++    }
++    __EXCEPT_ALL
++    {
++        ok = 0;
++    }
++    __ENDTRY
++    return ok;
++}
++
++static ULONG64 ps5_pe_layout_rip( void *stack )
++{
++    ULONG_PTR addr = (ULONG_PTR)stack;
++    ULONG_PTR limit = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
++    ULONG_PTR base = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
++    ULONG64 rip = 0;
++
++    if (!stack || (addr & 7) || addr < limit || addr + 0x38 > base) return 0;
++    __TRY
++    {
++        rip = *(ULONG64 *)(addr + 0x30);
++    }
++    __EXCEPT_ALL
++    {
++        rip = 0;
++    }
++    __ENDTRY
++    return rip;
++}
++
++static unsigned int ps5_pe_slots( ULONG_PTR rsp, ULONG_PTR *slots, unsigned int max )
++{
++    ULONG_PTR limit = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
++    ULONG_PTR base = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
++    unsigned int n = 0;
++
++    if ((rsp & 7) || rsp < limit || rsp >= base) return 0;
++    n = (unsigned int)((base - rsp) / sizeof(ULONG_PTR));
++    if (n > max) n = max;
++    __TRY
++    {
++        memcpy( slots, (void *)rsp, n * sizeof(ULONG_PTR) );
++    }
++    __EXCEPT_ALL
++    {
++        n = 0;
++    }
++    __ENDTRY
++    return n;
++}
++
++static void *ps5_pe_callback_fn( unsigned int id )
++{
++    KERNEL_CALLBACK_PROC *table;
++    void *fn = NULL;
++
++    if (id >= 256 || !NtCurrentTeb()->Peb) return NULL;
++    table = NtCurrentTeb()->Peb->KernelCallbackTable;
++    if (!table) return NULL;
++    __TRY
++    {
++        fn = (void *)table[id];
++    }
++    __EXCEPT_ALL
++    {
++        fn = NULL;
++    }
++    __ENDTRY
++    return fn;
++}
++
++/* File only, stack buffers, at most 64 lines per process. Single-step and
++ * breakpoints are not this record: they would spend the cap. */
++static void ps5_log_pe_callback( EXCEPTION_RECORD *record, void *frame, CONTEXT *context, int swallow )
++{
++    char line[512], where[80], caller[80], fnat[80];
++    BYTE *teb = (BYTE *)NtCurrentTeb();
++    DWORD depth, teb_id;
++    void *cb_stack, *fn, *args;
++    ULONG frame_id, len;
++    ULONG64 caller_rip, layout_rip;
++    unsigned int named, i, n, info_n;
++    ULONG_PTR slots[16], rsp, limit, base, rbp, ret, next;
++    const char *access = "-";
++    ULONG_PTR target = 0;
++    int frame_ok, pos;
++
++    if (record->ExceptionCode == EXCEPTION_SINGLE_STEP ||
++        record->ExceptionCode == EXCEPTION_BREAKPOINT) return;
++
++    depth = *(DWORD *)(teb + 0x34c);
++    teb_id = *(DWORD *)(teb + 0x350);
++    cb_stack = *(void **)(teb + 0x358);
++    frame_ok = ps5_pe_frame( frame, &frame_id, &args, &len, &caller_rip );
++    if (depth) named = teb_id;
++    else if (frame_ok && frame_id < 256) named = frame_id;
++    else named = ~0u;
++
++    if (record->NumberParameters >= 1)
++    {
++        if (record->ExceptionInformation[0] == 0) access = "read";
++        else if (record->ExceptionInformation[0] == 1) access = "write";
++        else if (record->ExceptionInformation[0] == 8) access = "execute";
++        else access = "other";
++    }
++    if (record->NumberParameters >= 2) target = record->ExceptionInformation[1];
++    ps5_pe_module( (ULONG_PTR)record->ExceptionAddress, where, sizeof(where) );
++    layout_rip = depth ? ps5_pe_layout_rip( cb_stack ) : 0;
++    if (!layout_rip && frame_ok) layout_rip = caller_rip;
++    if (layout_rip) ps5_pe_module( (ULONG_PTR)layout_rip, caller, sizeof(caller) );
++    else
++    {
++        caller[0] = '-';
++        caller[1] = 0;
++    }
++    fn = ps5_pe_callback_fn( named );
++    if (fn) ps5_pe_module( (ULONG_PTR)fn, fnat, sizeof(fnat) );
++    else
++    {
++        fnat[0] = '-';
++        fnat[1] = 0;
++    }
++    pos = snprintf( line, sizeof(line),
++                    "wine-ps5: callback-fault where=pe code=%#x flags=%#x addr=%p nested=%p params=%u "
++                    "access=%s target=%#llx rip=%s id=%u name=%s teb_id=%u frame_id=%u depth=%u stack=%p "
++                    "fn=%p fn_at=%s from=%s to=%s swallow=%d caller=%s args=%p len=%u\n",
++                    (unsigned int)record->ExceptionCode, (unsigned int)record->ExceptionFlags,
++                    record->ExceptionAddress, record->ExceptionRecord,
++                    (unsigned int)record->NumberParameters, access,
++                    (unsigned long long)target, where, named, ps5_callback_name( named ),
++                    (unsigned int)teb_id, (unsigned int)frame_id, (unsigned int)depth, cb_stack, fn, fnat,
++                    named < 25 ? "win32u" : "?", named < 25 ? "user32" : "?",
++                    swallow, caller, args, (unsigned int)len );
++    if (pos < 0) return;
++    if ((size_t)pos >= sizeof(line))
++    {
++        line[sizeof(line) - 2] = '\n';
++        line[sizeof(line) - 1] = 0;
++    }
++    if (!ps5_pe_line( line )) return;
++
++    info_n = record->NumberParameters;
++    if (info_n > EXCEPTION_MAXIMUM_PARAMETERS) info_n = EXCEPTION_MAXIMUM_PARAMETERS;
++    if (info_n > 2)
++    {
++        pos = snprintf( line, sizeof(line), "wine-ps5: callback-fault info" );
++        if (pos < 0) pos = 0;
++        for (i = 0; i < info_n && (size_t)pos + 24 < sizeof(line); i++)
++            pos += snprintf( line + pos, sizeof(line) - pos, " %u=%#llx", i,
++                             (unsigned long long)record->ExceptionInformation[i] );
++        if ((size_t)pos + 2 < sizeof(line))
++        {
++            line[pos++] = '\n';
++            line[pos] = 0;
++        }
++        if (!ps5_pe_line( line )) return;
++    }
++
++    if (!context) return;
++    pos = snprintf( line, sizeof(line),
++                    "wine-ps5: callback-fault regs rax=%#llx rbx=%#llx rcx=%#llx rdx=%#llx rsi=%#llx rdi=%#llx "
++                    "rbp=%#llx rsp=%#llx r8=%#llx r9=%#llx r10=%#llx r11=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
++                    (unsigned long long)context->Rax, (unsigned long long)context->Rbx,
++                    (unsigned long long)context->Rcx, (unsigned long long)context->Rdx,
++                    (unsigned long long)context->Rsi, (unsigned long long)context->Rdi,
++                    (unsigned long long)context->Rbp, (unsigned long long)context->Rsp,
++                    (unsigned long long)context->R8, (unsigned long long)context->R9,
++                    (unsigned long long)context->R10, (unsigned long long)context->R11,
++                    (unsigned long long)context->R12, (unsigned long long)context->R13,
++                    (unsigned long long)context->R14, (unsigned long long)context->R15 );
++    if (pos > 0)
++    {
++        if ((size_t)pos >= sizeof(line))
++        {
++            line[sizeof(line) - 2] = '\n';
++            line[sizeof(line) - 1] = 0;
++        }
++        if (!ps5_pe_line( line )) return;
++    }
++
++    rsp = context->Rsp;
++    n = ps5_pe_slots( rsp, slots, 16 );
++    for (i = 0; i < n; i++)
++    {
++        ps5_pe_module( slots[i], where, sizeof(where) );
++        snprintf( line, sizeof(line), "wine-ps5: callback-fault stack%u %#llx %s\n",
++                  i, (unsigned long long)slots[i], where );
++        if (!ps5_pe_line( line )) return;
++    }
++    limit = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
++    base = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
++    rbp = context->Rbp;
++    for (i = 0; i < 16; i++)
++    {
++        int got = 0;
++
++        if ((rbp & 7) || rbp < limit || rbp + 16 > base) break;
++        __TRY
++        {
++            next = *(ULONG_PTR *)rbp;
++            ret = *(ULONG_PTR *)(rbp + 8);
++            got = 1;
++        }
++        __EXCEPT_ALL
++        {
++            got = 0;
++        }
++        __ENDTRY
++        if (!got) break;
++        ps5_pe_module( ret, where, sizeof(where) );
++        snprintf( line, sizeof(line), "wine-ps5: callback-fault frame%u rip=%#llx %s rbp=%#llx\n",
++                  i, (unsigned long long)ret, where, (unsigned long long)rbp );
++        if (!ps5_pe_line( line )) return;
++        if (next <= rbp) break;
++        rbp = next;
++    }
++}
++
++static int ps5_env_noswallow( int *present )
++{
++    const WCHAR *env, *p;
++    static const WCHAR name[] = L"WINE_PS5_CB_NOSWALLOW=";
++    unsigned int nlen = ARRAY_SIZE(name) - 1;
++    unsigned int scanned = 0;
++    int on = 0;
++
++    *present = 0;
++    if (!NtCurrentTeb()->Peb || !NtCurrentTeb()->Peb->ProcessParameters) return 0;
++    env = NtCurrentTeb()->Peb->ProcessParameters->Environment;
++    if (!env) return 0;
++    __TRY
++    {
++        for (p = env; *p && scanned < 65536; )
++        {
++            unsigned int i, len = 0;
++
++            while (p[len] && scanned + len < 65536) len++;
++            scanned += len + 1;
++            if (len >= nlen)
++            {
++                for (i = 0; i < nlen; i++)
++                    if (p[i] != name[i]) break;
++                if (i == nlen)
++                {
++                    *present = 1;
++                    on = len == nlen + 1 && p[nlen] == L'1';
++                    break;
++                }
++            }
++            p += len + 1;
++        }
++    }
++    __EXCEPT_ALL
++    {
++        *present = 0;
++        on = 0;
++    }
++    __ENDTRY
++    return on;
++}
++
++static int ps5_registry_noswallow(void)
++{
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING name;
++    HANDLE root = 0, key = 0;
++    char buf[64];
++    KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buf;
++    DWORD count = 0;
++    int on = 0;
++
++    if (RtlOpenCurrentUser( KEY_READ, &root )) return 0;
++    RtlInitUnicodeString( &name, L"Software\\Wine\\PS5" );
++    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, root, NULL );
++    if (!NtOpenKey( &key, KEY_READ, &attr ))
++    {
++        RtlInitUnicodeString( &name, L"CallbackNoSwallow" );
++        if (!NtQueryValueKey( key, &name, KeyValuePartialInformation, buf, sizeof(buf), &count ) &&
++            info->Type == REG_DWORD && info->DataLength >= sizeof(DWORD) &&
++            *(DWORD *)info->Data == 1)
++            on = 1;
++        NtClose( key );
++    }
++    NtClose( root );
++    return on;
++}
++
++#endif /* __x86_64__ */
++
++void ps5_read_callback_noswallow(void)
++{
++#if defined(__x86_64__)
++    int present = 0, env = ps5_env_noswallow( &present );
++
++    ps5_noswallow = present ? env : ps5_registry_noswallow();
++#endif
++}
++
+ #if defined(__WINE_PE_BUILD) && !defined(__i386__)
+ 
+ /*******************************************************************
+@@ -288,6 +691,12 @@ EXCEPTION_DISPOSITION WINAPI user_callback_handler( EXCEPTION_RECORD *record, vo
+ {
+     if (!(record->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)))
+     {
++#if defined(__x86_64__)
++        int swallow = !ps5_noswallow;
++
++        ps5_log_pe_callback( record, frame, context, swallow );
++        if (!swallow) return ExceptionContinueSearch;
++#endif
+         ERR( "ignoring exception %lx\n", record->ExceptionCode );
+         RtlUnwind( frame, KiUserCallbackDispatcherReturn, record, ULongToPtr(record->ExceptionCode) );
+     }
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 20e3b0b..9140bdb 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -4701,6 +4701,7 @@ void loader_init( CONTEXT *context, void **entry )
+         init_user_process_params();
+         load_global_options();
+         version_init();
++        ps5_read_callback_noswallow();
+         open_known_dll_ntdir();
+ 
+         default_load_path = peb->ProcessParameters->DllPath.Buffer;
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index a0a6f1b..6fa6de0 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -66,6 +66,8 @@ extern LONG WINAPI call_unhandled_exception_filter( PEXCEPTION_POINTERS eptr );
+ extern void register_module_exception_directory( void *module );
+ extern void unregister_module_exception_directory( void *module );
+ extern void WINAPI process_breakpoint(void);
++/* Process start, before any user callback: HKCU\Software\Wine\PS5 CallbackNoSwallow. */
++extern void ps5_read_callback_noswallow(void);
+ 
+ static inline BOOL is_valid_frame( ULONG_PTR frame )
+ {
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index b0a987a..d74d477 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -667,6 +667,9 @@ struct amd64_thread_data
+ #ifdef __PROSPERO__
+     void                 *tcb_thread;    /* 0340 libkernel's %fs:0x10 in this thread (signal_wow_alias_teb) */
+     DWORD                 wow_alias;     /* 0348 the 32-bit TEB: 0 not placed yet, 1 at the FS base's low half, 2 switched */
++    DWORD                 ps5_callback_depth; /* 034c KeUserModeCallback nesting; the PE handler reads this offset */
++    DWORD                 ps5_callback_id;    /* 0350 the id argument, valid while depth is non-zero */
++    void                 *ps5_callback_stack; /* 0358 callback_stack_layout of the active call */
+ #endif
+ };
+ 
+@@ -679,6 +682,14 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxc
+ #ifdef __PROSPERO__
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, tcb_thread ) == 0x340 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_alias ) == 0x348 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, ps5_callback_depth ) == 0x34c );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, ps5_callback_id ) == 0x350 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, ps5_callback_stack ) == 0x358 );
++/* ps5_module_of reads these fields by offset. The PE handler uses the struct. */
++C_ASSERT( offsetof( LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks ) == 0x10 );
++C_ASSERT( offsetof( LDR_DATA_TABLE_ENTRY, DllBase ) == 0x30 );
++C_ASSERT( offsetof( LDR_DATA_TABLE_ENTRY, SizeOfImage ) == 0x40 );
++C_ASSERT( offsetof( LDR_DATA_TABLE_ENTRY, BaseDllName ) == 0x58 );
+ #endif
+ 
+ static inline struct amd64_thread_data *amd64_thread_data(void)
+@@ -1780,6 +1791,172 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+ }
+ 
+ 
++#ifdef __PROSPERO__
++/* user32's KernelCallbackTable, in the order of include/ntuser.h ALL_USER32_CALLBACKS.
++ * win32u enters every one of these through KeUserModeCallback. */
++static const char *ps5_callback_name( unsigned int id )
++{
++    static const char *const names[] =
++    {
++        "CallDispatchCallback", "CallEnumDisplayMonitor", "CallSendAsyncCallback",
++        "CallWinEventHook", "CallWinProc", "CallWindowsHook", "CopyImage",
++        "DrawNonClientButton", "DrawScrollBar", "DrawText", "FreeCachedClipboardData",
++        "ImmProcessKey", "ImmTranslateMessage", "InitBuiltinClasses", "LoadDriver",
++        "LoadImage", "LoadSysMenu", "PostDDEMessage", "RenderSynthesizedFormat",
++        "UnpackDDEMessage", "DragDropEnter", "DragDropLeave", "DragDropDrag",
++        "DragDropDrop", "DragDropPost",
++    };
++    return id < ARRAY_SIZE(names) ? names[id] : "?";
++}
++
++static int ps5_read_bytes( const void *addr, void *buf, SIZE_T size )
++{
++    return addr && virtual_uninterrupted_read_memory( addr, buf, size ) == size;
++}
++
++/* name+offset of a guest address, from the PEB loader list. A bad link stops the walk. */
++static void ps5_module_of( ULONG_PTR addr, char *out, size_t n )
++{
++    PEB_LDR_DATA *ldr;
++    LIST_ENTRY link;
++    void *head;
++    int i;
++
++    snprintf( out, n, "%#llx", (unsigned long long)addr );
++    if (!addr || !NtCurrentTeb()->Peb) return;
++    ldr = NtCurrentTeb()->Peb->LdrData;
++    head = &ldr->InMemoryOrderModuleList;
++    if (!ps5_read_bytes( head, &link, sizeof(link) )) return;
++    for (i = 0; i < 512 && link.Flink && link.Flink != head; i++)
++    {
++        struct
++        {
++            void *DllBase;
++            void *EntryPoint;
++            ULONG SizeOfImage;
++            ULONG pad;
++            UNICODE_STRING FullDllName;
++            UNICODE_STRING BaseDllName;
++        } info;
++        WCHAR wname[24];
++        char name[24];
++        unsigned int k, chars;
++        void *entry = (char *)link.Flink - 0x10; /* InMemoryOrderLinks */
++
++        if (!ps5_read_bytes( (char *)entry + 0x30, &info, sizeof(info) )) return;
++        if (addr >= (ULONG_PTR)info.DllBase && info.SizeOfImage &&
++            addr - (ULONG_PTR)info.DllBase < info.SizeOfImage)
++        {
++            chars = info.BaseDllName.Length / sizeof(WCHAR);
++            if (chars > 23) chars = 23;
++            if (!ps5_read_bytes( info.BaseDllName.Buffer, wname, chars * sizeof(WCHAR) )) chars = 0;
++            for (k = 0; k < chars; k++)
++                name[k] = (wname[k] >= 32 && wname[k] < 127) ? (char)wname[k] : '?';
++            name[k] = 0;
++            snprintf( out, n, "%s+%#llx", name[0] ? name : "?",
++                      (unsigned long long)(addr - (ULONG_PTR)info.DllBase) );
++            return;
++        }
++        if (!ps5_read_bytes( link.Flink, &link, sizeof(link) )) return;
++    }
++}
++
++static void ps5_log_line( const char *line )
++{
++    wine_write_stderr( line, strlen( line ) );
++}
++
++/* A fault while a KeUserModeCallback is on the stack. Stack buffer, at most 64 lines
++ * per process, no heap. Single-step and breakpoints are not this record. */
++static void ps5_log_callback_fault( EXCEPTION_RECORD *rec, CONTEXT *context )
++{
++    static int lines;
++    struct amd64_thread_data *cpu = amd64_thread_data();
++    char line[512], where[80], caller[80];
++    ULONG_PTR slots[16], rsp, limit, base, rbp, ret, next;
++    unsigned int id, n, i;
++    const char *access = "-";
++    ULONG_PTR target = 0;
++    ULONG64 caller_rip = 0;
++
++    if (!cpu->ps5_callback_depth) return;
++    if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP || rec->ExceptionCode == EXCEPTION_BREAKPOINT) return;
++    if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) >= 64) return;
++
++    if (rec->NumberParameters >= 1)
++    {
++        if (rec->ExceptionInformation[0] == 0) access = "read";
++        else if (rec->ExceptionInformation[0] == 1) access = "write";
++        else if (rec->ExceptionInformation[0] == 8) access = "execute";
++        else access = "other";
++    }
++    if (rec->NumberParameters >= 2) target = rec->ExceptionInformation[1];
++    id = cpu->ps5_callback_id;
++    ps5_module_of( (ULONG_PTR)rec->ExceptionAddress, where, sizeof(where) );
++    caller[0] = '-';
++    caller[1] = 0;
++    if (cpu->ps5_callback_stack &&
++        ps5_read_bytes( (char *)cpu->ps5_callback_stack + 0x30, &caller_rip, sizeof(caller_rip) ) &&
++        caller_rip)
++        ps5_module_of( (ULONG_PTR)caller_rip, caller, sizeof(caller) );
++    snprintf( line, sizeof(line),
++              "wine-ps5: callback-fault where=unix code=%#x flags=%#x addr=%p params=%u access=%s target=%#llx "
++              "rip=%s id=%u name=%s depth=%u stack=%p from=%s to=%s caller=%s\n",
++              (unsigned int)rec->ExceptionCode, (unsigned int)rec->ExceptionFlags, rec->ExceptionAddress,
++              (unsigned int)rec->NumberParameters, access, (unsigned long long)target, where, id,
++              ps5_callback_name( id ), cpu->ps5_callback_depth, cpu->ps5_callback_stack,
++              id < 25 ? "win32u" : "?", id < 25 ? "user32" : "?", caller );
++    ps5_log_line( line );
++    if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) >= 64) return;
++    snprintf( line, sizeof(line),
++              "wine-ps5: callback-fault regs rax=%#llx rbx=%#llx rcx=%#llx rdx=%#llx rsi=%#llx rdi=%#llx "
++              "rbp=%#llx rsp=%#llx r8=%#llx r9=%#llx r10=%#llx r11=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
++              (unsigned long long)context->Rax, (unsigned long long)context->Rbx,
++              (unsigned long long)context->Rcx, (unsigned long long)context->Rdx,
++              (unsigned long long)context->Rsi, (unsigned long long)context->Rdi,
++              (unsigned long long)context->Rbp, (unsigned long long)context->Rsp,
++              (unsigned long long)context->R8, (unsigned long long)context->R9,
++              (unsigned long long)context->R10, (unsigned long long)context->R11,
++              (unsigned long long)context->R12, (unsigned long long)context->R13,
++              (unsigned long long)context->R14, (unsigned long long)context->R15 );
++    ps5_log_line( line );
++
++    rsp = context->Rsp;
++    limit = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
++    base = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
++    n = 0;
++    if (!(rsp & 7) && rsp >= limit && rsp < base)
++    {
++        n = (unsigned int)((base - rsp) / sizeof(ULONG_PTR));
++        if (n > 16) n = 16;
++        if (!ps5_read_bytes( (void *)rsp, slots, n * sizeof(ULONG_PTR) )) n = 0;
++    }
++    for (i = 0; i < n; i++)
++    {
++        if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) >= 64) return;
++        ps5_module_of( slots[i], where, sizeof(where) );
++        snprintf( line, sizeof(line), "wine-ps5: callback-fault stack%u %#llx %s\n",
++                  i, (unsigned long long)slots[i], where );
++        ps5_log_line( line );
++    }
++    rbp = context->Rbp;
++    for (i = 0; i < 16; i++)
++    {
++        if ((rbp & 7) || rbp < limit || rbp + 16 > base) break;
++        if (!ps5_read_bytes( (void *)rbp, &next, sizeof(next) )) break;
++        if (!ps5_read_bytes( (void *)(rbp + 8), &ret, sizeof(ret) )) break;
++        if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) >= 64) return;
++        ps5_module_of( ret, where, sizeof(where) );
++        snprintf( line, sizeof(line), "wine-ps5: callback-fault frame%u rip=%#llx %s rbp=%#llx\n",
++                  i, (unsigned long long)ret, where, (unsigned long long)rbp );
++        ps5_log_line( line );
++        if (next <= rbp) break;
++        rbp = next;
++    }
++}
++#endif
++
++
+ /***********************************************************************
+  *           setup_raise_exception
+  */
+@@ -1797,6 +1974,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
+     /* An exception in an instruction a page fault opened its host page for (virtual_handle_fault): it does not
+      * complete, so the page closes now, and the context the program gets keeps only its own trap flag. */
+     if (virtual_ps5_step_done() && !ntdll_get_thread_data()->ps5_step_tf) context->EFlags &= ~0x100;
++    ps5_log_callback_fault( rec, context );
+ #endif
+     if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP)
+     {
+@@ -2143,7 +2321,25 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
+     stack->machine_frame.rip = frame->rip;
+     stack->machine_frame.rsp = frame->rsp;
+     memcpy( stack->args_data, args, len );
++#ifdef __PROSPERO__
++    {
++        struct amd64_thread_data *cpu = amd64_thread_data();
++        DWORD saved_id = cpu->ps5_callback_id;
++        DWORD saved_depth = cpu->ps5_callback_depth;
++        void *saved_stack = cpu->ps5_callback_stack;
++        NTSTATUS status;
++        cpu->ps5_callback_id = id;
++        cpu->ps5_callback_depth = saved_depth + 1;
++        cpu->ps5_callback_stack = stack;
++        status = call_user_mode_callback( rsp, ret_ptr, ret_len, pKiUserCallbackDispatcher, NtCurrentTeb() );
++        cpu->ps5_callback_id = saved_id;
++        cpu->ps5_callback_depth = saved_depth;
++        cpu->ps5_callback_stack = saved_stack;
++        return status;
++    }
++#else
+     return call_user_mode_callback( rsp, ret_ptr, ret_len, pKiUserCallbackDispatcher, NtCurrentTeb() );
++#endif
+ }
+ 
+ 
+@@ -4029,6 +4225,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "movq %rbx,0x08(%rcx)\n\t"
+                    __ASM_CFI_REG_IS_AT1(rbx, rcx, 0x08)
+                    "movq %rdx,0x18(%rcx)\n\t"
++                   "movq %r10,0x40(%rcx)\n\t"      /* first argument; the callee clobbers r10 */
+                    "movq %rsi,0x20(%rcx)\n\t"
+                    __ASM_CFI_REG_IS_AT1(rsi, rcx, 0x20)
+                    "movq %rdi,0x28(%rcx)\n\t"
+@@ -4139,6 +4336,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "jae " __ASM_LOCAL_LABEL("bad_syscall") "\n\t"
+                    "movq (%rbx),%rcx\n\t"          /* table->ServiceTable */
+                    "movq (%rcx,%rax,8),%r12\n\t"
++                   "testq %r12,%r12\n\t"           /* unimplemented id: the slot is NULL */
++                   "jz " __ASM_LOCAL_LABEL("bad_syscall") "\n\t"
+                    "movq 24(%rbx),%rcx\n\t"        /* table->ArgumentTable */
+                    "movzbl (%rcx,%rax),%ecx\n\t"
+                    "subq $0x30,%rcx\n\t"
+@@ -4174,6 +4373,25 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+ #ifdef __PROSPERO__
+                    "cmpl $0,0x3e0(%r13)\n\t"     /* thread_data->ps5_terminating */
+                    "jnz " __ASM_NAME("ps5_dispatcher_terminate") "\n\t"
++                   /* Every Nt* return comes through here, including ps5_narrow_syscall.
++                    * 0xC0000024 is STATUS_OBJECT_TYPE_MISMATCH. Name the syscall before
++                    * the guest sees it. Two pushes keep the call aligned; rax and rcx
++                    * are the status and the frame, and the epilogue reloads rsp from rcx. */
++                   "cmpl $0xc0000024,%eax\n\t"
++                   "jne " __ASM_LOCAL_LABEL("ps5_type_mismatch_done") "\n\t"
++                   "pushq %rax\n\t"
++                   "pushq %rcx\n\t"
++                   "movq 0x40(%rcx),%r8\n\t"     /* r10 saved at entry: the handle */
++                   "movq 0x88(%rcx),%r9\n\t"     /* guest rsp after the entry pop */
++                   "movl 0xb0(%rcx),%edi\n\t"    /* frame->syscall_id */
++                   "movq 0x18(%rcx),%rsi\n\t"    /* rdx saved at entry: 2nd argument */
++                   "movq 0x70(%rcx),%rdx\n\t"    /* frame->rip, 0xb before the guest return */
++                   "movq %r8,%rcx\n\t"
++                   "movq %r9,%r8\n\t"
++                   "call " __ASM_NAME("ps5_note_type_mismatch") "\n\t"
++                   "popq %rcx\n\t"
++                   "popq %rax\n\t"
++                   __ASM_LOCAL_LABEL("ps5_type_mismatch_done") ":\n\t"
+ #endif
+                    /* push rbp-based kernel stack cfi */
+                    __ASM_CFI(".cfi_remember_state\n\t")

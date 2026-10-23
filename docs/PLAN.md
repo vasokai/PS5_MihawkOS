@@ -1,3 +1,59 @@
+## Diagnostic ntdll for the swallowed callback fault (2026-10-23, no console run)
+
+The 36e5564 run died in `user_callback_handler ignoring exception c0000005`, after uxtheme loaded and `RtlSetIoCompletionCallback` logged its flags. That handler is the SEH frame on `KiUserCallbackDispatcher`. It unwinds the frame and returns the exception code, so the access violation stays inside the callback and WoW's unhandled filter does not write Crash.txt. `RtlSetIoCompletionCallback` itself is a direct ntdll call (`dlls/ntdll/threadpool.c`), not a user callback. The five `NtSetIoCompletion` lines before it are `kernelbase!PostQueuedCompletionStatus` and execution continues past them.
+
+Patch 1247 keeps that unwind unless asked not to. It adds a file-only record, stack buffers, no heap, at most 64 lines a process on each side. The line is `wine-ps5: callback-fault`.
+
+The Unix signal path (`setup_raise_exception`) writes when `KeUserModeCallback` is on the stack. The PE handler writes for every exception that handler sees, other than a single-step or a breakpoint, which would spend the cap and are still swallowed. Each line carries the `EXCEPTION_RECORD` (code, flags, nested record, parameter count, fault address, and for an access violation the read/write/execute flag and the target address), the callback id, the registers, up to sixteen qwords at the guest `rsp`, and up to sixteen return addresses walked from `rbp`. The faulting RIP and each return address are resolved against the PEB loader list as `module+offset`. A bad loader link stops the walk. The PE side does not call `RtlPcToFileHeader`, which takes the loader lock.
+
+The id is the one `KeUserModeCallback` passed to `KiUserCallbackDispatcher`. It is stored in the TEB at `0x350`, with the nesting depth at `0x34c` and the callback frame at `0x358`, inside the existing `cpu_data` and short of `syscall_table` at `0x370`. Depth `0` means no callback is active. Id `0` is a real callback, so the depth is the validity flag. The PE handler also reads the SEH establisher frame (`args` at `+0x20`, length at `+0x28`, id at `+0x2c`, unix return address at `+0x30`) and the `KernelCallbackTable` entry.
+
+Ids `0` through `24` are `include/ntuser.h` `ALL_USER32_CALLBACKS`. Wine's comment there says these functions live in `user32.dll`. win32u enters them with `KeUserModeCallback`, so a logged id below 25 is `from=win32u` `to=user32`. The names, in order, and the win32u call:
+
+| id | name | entered from |
+| --- | --- | --- |
+| 0 | CallDispatchCallback | user32 dispatch |
+| 1 | CallEnumDisplayMonitor | `sysparams.c` |
+| 2 | CallSendAsyncCallback | `message.c` |
+| 3 | CallWinEventHook | `message.c`, `hook.c` |
+| 4 | CallWinProc | `message.c` `NtUserCallWinProc` |
+| 5 | CallWindowsHook | `hook.c` |
+| 6 | CopyImage | `cursoricon.c` |
+| 7 | DrawNonClientButton | `defwnd.c` |
+| 8 | DrawScrollBar | `scroll.c` |
+| 9 | DrawText | `font.c` |
+| 10 | FreeCachedClipboardData | `clipboard.c` |
+| 11 | ImmProcessKey | `imm.c` |
+| 12 | ImmTranslateMessage | `imm.c` |
+| 13 | InitBuiltinClasses | `class.c` |
+| 14 | LoadDriver | `driver.c` |
+| 15 | LoadImage | `cursoricon.c` |
+| 16 | LoadSysMenu | `menu.c` |
+| 17 | PostDDEMessage | `message.c` |
+| 18 | RenderSynthesizedFormat | `clipboard.c` |
+| 19 | UnpackDDEMessage | `message.c` |
+| 20 | DragDropEnter | `clipboard.c` |
+| 21 | DragDropLeave | `clipboard.c` |
+| 22 | DragDropDrag | `clipboard.c` |
+| 23 | DragDropDrop | `clipboard.c` |
+| 24 | DragDropPost | `clipboard.c` |
+
+The table is 256 slots. Slots 25 and above are empty. A theme load commonly reaches `InitBuiltinClasses`, `CallWinProc`, `CallWindowsHook`, `DrawText` or `LoadSysMenu`. Which of those, if any, faulted in the 36e5564 process is what the next console run prints. This build does not say the faulting instruction is an unimplemented service, and it does not say the access violation is gone.
+
+`WINE_PS5_CB_NOSWALLOW=1` in the process environment, or `HKCU\Software\Wine\PS5` value `CallbackNoSwallow` as a DWORD `1`, skips `RtlUnwind`. The exception then continues the search, which is the path that lets WoW write Crash.txt. The environment is read from the PEB block at process start. If the variable is present, `1` enables propagation and any other value forces the unwind, including when the registry is `1`. If it is absent, the registry value is used. The registry is opened once, after `version_init`, not from the handler and not from `KeUserModeCallback`. The default is unset, so the unwind matches 36e5564. The existing `err:seh:user_callback_handler ignoring exception` line is still printed when the handler swallows.
+
+Syscall numbers are the 19045 table. `0xe9` is `NtFlushInstructionCache`. `NtSetIoCompletion` is `0x1a3`. The three checker commands exit 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls` prints `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. `--pe` on `ntdll.dll` and `--unix` on `ntdll.shared.elf` print the same and agree slot for slot. The `cmpl $0x3a3` immediate (protocol 931) occurs 26 times in the new shared ELF, the same count as the 36e5564 shared ELF. wineserver was not rebuilt. The 32-bit ntdll and wow64 were not rebuilt. This trio was not run on a console.
+
+Install the three ntdll files together. The `--no-opengl` `win32u` is not a replacement for the title's OpenGL `win32u.prx.elf`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `4c69ea7f3ada56159e3353f6c5b9fbce8ccaab6a44e3fa056a8f2c75d3a2d562` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,421,892 | `976bcc05d89f3e78ee76ab500fb67e31bfeb0fede29542e506ede0dfdf1df6c1` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,207,058 | `960a8cb592dea9ba8edff7b53fcef2ab562b4c9f471d89cfe9b47d74a774daad` |
+
+Build products: `.deps/wine-ps5/build/dlls/ntdll/x86_64-windows/ntdll.dll`, `.deps/wine-ps5/prx/ntdll.elf` (stage as `ntdll.prx.elf`), `.deps/wine-ps5/prx/sce_module/ntdll.prx`. The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,847,384 bytes, `94cf6546698b75e1602b660e545b73586468ec6110849b64ab599ae7adb71c02`. wineserver was not rebuilt: `wineserver.prx.elf` is 1,033,060 bytes, `52f661a15fa37e66b4ecf41f2b0e79e95187e2069614894b4f6024aa81e5eb1f`, and `wineserver.prx` is 829,643 bytes, `650c8fc84d1a5973f97bcc3393248b5a3c2b77170976114f29ad7dc6f1a1cdd1`.
+
 ## 36e5564 on the console: Play returns to Play (2026-10-23)
 
 The 19045 ntdll trio was installed and hash-checked: `ntdll.dll` `2f6d3c31…`, `ntdll.prx.elf` `ddcf4c90…`, `ntdll.prx` `87ed5b12…`. Battle.net stayed up. Clicking Play on WoW Classic beta showed Launching and returned to Play. No Blizzard error, and no Crash.txt for this ntdll. The bundle's `2026-10-23 11.58.45` Crash.txt is the previous image: its DBG-MODULE list puts `ntdll.dll` at `0xDFFFF40000` and the fault at `0xDFFFFA5903`.
