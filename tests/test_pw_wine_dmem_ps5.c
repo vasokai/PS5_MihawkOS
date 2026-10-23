@@ -8,8 +8,9 @@
  * The guard against mappings that are not Wine's runs against the same model: sceKernelVirtualQuery reads
  * /proc/self/maps (a PROT_NONE anonymous entry is a bare reservation, protection 0 and flags 0).
  *   cc -std=gnu11 -Itests/include tests/test_pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem.c \
- *      wine/ps5/pw_wine_heap.c wine/ps5/pw_wine_pages.c wine/ps5/pw_wine_vm.c -lpthread */
+ *      wine/ps5/pw_wine_heap.c wine/ps5/pw_wine_pages.c wine/ps5/pw_wine_vm.c wine/ps5/pw_wine_dmap.c -lpthread */
 #define _GNU_SOURCE
+#include "../wine/ps5/pw_wine_dmap.h"
 #include "../wine/ps5/pw_wine_pages.h"
 #include <assert.h>
 #include <errno.h>
@@ -308,8 +309,8 @@ static unsigned kernel_protection(const void *address)
 }
 static uint64_t backed_bytes(void)
 {
-    uint64_t v[15];
-    assert(__wine_ps5_memory_stats(v, 15) == 15);
+    uint64_t v[17];
+    assert(__wine_ps5_memory_stats(v, 17) == 17);
     return v[0];
 }
 
@@ -894,6 +895,65 @@ static void lay_measured(void)
     assert(__wine_ps5_lay(page, PAGE) == -1);
 }
 
+/* A shared view of a section the title keeps in direct memory is that RAM. A file it does not, and an executable
+ * view, stay ordinary mappings. */
+static uint64_t section_ino;
+static int section_maps;
+static int section_identity(void *context, int fd, uint64_t *dev, uint64_t *ino)
+{
+    struct stat st;
+    (void)context;
+    if (fstat(fd, &st)) return -1;
+    *dev = (uint64_t)st.st_dev;
+    *ino = (uint64_t)st.st_ino;
+    return 0;
+}
+static int section_page(void *context, uint64_t dev, uint64_t ino, uint64_t offset, int64_t *dmem,
+                        uint64_t *chunk_offset, uint64_t *chunk_bytes)
+{
+    (void)context; (void)dev; (void)offset;
+    if (ino != section_ino) { errno = ENOENT; return -1; }
+    *dmem = 0x500000;
+    *chunk_offset = 0;
+    *chunk_bytes = 2u << 20;
+    return 0;
+}
+static int section_map(void *context, uintptr_t address, size_t bytes, int64_t dmem)
+{
+    (void)context; (void)dmem;
+    section_maps++;
+    return mmap((void *)address, bytes, RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)address ? 0 : -1;
+}
+static void shared_section_direct(void)
+{
+    const uintptr_t base = region(64 << 20);
+    unsigned char *page = (unsigned char *)base + PAGE, *reading = page + PAGE, *plain = page + 2 * PAGE, *exec = page + 4 * PAGE;
+    const int direct_fd = memfd_create("section", 0), plain_fd = memfd_create("plain", 0);
+    struct stat st;
+    uint64_t before[17], after[17];
+    const PwWineDmapOps ops = { NULL, section_identity, section_page, section_map };
+
+    payload(1, 1);
+    assert(!__wine_ps5_dmem_region((void *)base, 64 << 20));
+    assert(direct_fd >= 0 && plain_fd >= 0 && !ftruncate(direct_fd, PAGE) && !ftruncate(plain_fd, PAGE));
+    assert(!fstat(direct_fd, &st));
+    section_ino = (uint64_t)st.st_ino;
+    pw_wine_dmap_init(&ops);
+    assert(__wine_ps5_memory_stats(before, 17) == 17);
+    assert(__wine_ps5_mmap(page, PAGE, RW, MAP_SHARED | MAP_FIXED, direct_fd, 0) == page && section_maps == 1);
+    page[0] = 0x5a;
+    assert(page[0] == 0x5a);
+    assert(__wine_ps5_mmap(reading, PAGE, PROT_READ, MAP_SHARED | MAP_FIXED, direct_fd, 0) == reading && section_maps == 2);
+    assert(kernel_protection(reading) == PROT_READ && reading[0] == 0);
+    assert(__wine_ps5_mmap(plain, PAGE, RW, MAP_SHARED | MAP_FIXED, plain_fd, 0) == plain && section_maps == 2);
+    plain[0] = 0x11;
+    assert(__wine_ps5_mmap(exec, PAGE, RW | PROT_EXEC, MAP_SHARED | MAP_FIXED, direct_fd, 0) == exec && section_maps == 2);
+    assert(__wine_ps5_memory_stats(after, 17) == 17);
+    assert(after[15] == before[15] + 2 * PAGE && after[16] == before[16] + PAGE);
+    close(direct_fd);
+    close(plain_fd);
+}
+
 static void in_child(void (*test)(void), const char *name)
 {
     int status = 0;
@@ -928,6 +988,7 @@ int main(void)
     in_child(foreign_inside_reservation, "foreign inside a reservation");
     in_child(guard_exports, "guard exports");
     in_child(lay_measured, "lay measured");
+    in_child(shared_section_direct, "shared section direct");
     puts("payload executable memory: direct and flexible memory never asked for execute, converted to JIT memory of "
          "exactly the range at the first execute through a temporary mapping in the helper's own range, contents "
          "and neighbours kept, direct memory released, then one kernel call per change; failures restored and "

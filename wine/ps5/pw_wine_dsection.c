@@ -19,6 +19,10 @@ typedef struct Section {
     int identity;                 /* the backing file, held until the chunks go back, or -1 */
 } Section;
 
+/* The collector copies the taken sections on its 256 KiB stack (pw_wine_process.c). */
+_Static_assert(sizeof(Section) * PW_WINE_DSECTION_SECTIONS <= (96u << 10),
+               "the section table copy no longer fits the collector stack");
+
 static pthread_mutex_t dsection_lock = PTHREAD_MUTEX_INITIALIZER;
 static PwWineDsectionOps dsection_ops;
 static Section sections[PW_WINE_DSECTION_SECTIONS];
@@ -56,7 +60,8 @@ int pw_wine_dsection_register(int fd, uint64_t dev, uint64_t ino, uint64_t size)
     int status = -1, error = ENOSPC;
 
     pthread_mutex_lock(&dsection_lock);
-    if (size < PW_WINE_DSECTION_MIN_BYTES || !dsection_ops.allocate) { error = EINVAL; goto done; }
+    if (size < PW_WINE_DSECTION_MIN_BYTES || size == (uint64_t)PW_WINE_DSECTION_SESSION_BYTES ||
+        !dsection_ops.allocate) { error = EINVAL; goto done; }
     if (find(dev, ino)) { error = EEXIST; goto done; }
     for (unsigned i = 0; i < PW_WINE_DSECTION_SECTIONS; i++) {
         if (sections[i].used) continue;

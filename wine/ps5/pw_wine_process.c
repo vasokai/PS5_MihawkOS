@@ -612,8 +612,12 @@ int pw_ps5_dsection_register(int fd, uint64_t dev, uint64_t ino, uint64_t size)
 {
     dsection_start();
     const int status = pw_wine_dsection_register(fd, dev, ino, size);
-    if (!status) fprintf(stderr, "wine-ps5: section of %llu MiB in direct memory\n", (unsigned long long)(size >> 20));
-    else if (size >= PW_WINE_DSECTION_MIN_BYTES)
+    if (!status) {
+        if (size >> 20)
+            fprintf(stderr, "wine-ps5: section of %llu MiB in direct memory\n", (unsigned long long)(size >> 20));
+        else
+            fprintf(stderr, "wine-ps5: section of %llu KiB in direct memory\n", (unsigned long long)(size >> 10));
+    } else if (size >= PW_WINE_DSECTION_MIN_BYTES && errno != EINVAL)
         fprintf(stderr, "wine-ps5: section of %llu MiB stays on a file: errno %d\n", (unsigned long long)(size >> 20), errno);
     return status;
 }

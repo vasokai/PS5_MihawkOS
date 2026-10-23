@@ -51,7 +51,7 @@ declare -A sources=(
     [test_pw_wine_dmem_regions]="wine/ps5/pw_wine_dmem.c"
     [test_pw_wine_heap]="wine/ps5/pw_wine_heap.c"
     [test_pw_wine_dmem_ps5]="wine/ps5/pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem.c wine/ps5/pw_wine_heap.c wine/ps5/pw_wine_pages.c wine/ps5/pw_wine_vm.c wine/ps5/pw_wine_alias.c
-        wine/ps5/pw_wine_perf.c"
+        wine/ps5/pw_wine_perf.c wine/ps5/pw_wine_dmap.c"
     [test_pw_wine_alias]="wine/ps5/pw_wine_alias.c"
     [test_pw_wine_mmu4k]="wine/ps5/pw_wine_mmu4k.c wine/ps5/pw_wine_mmu4k_slot.S wine/ps5/pw_wine_alias.c src/pw_ia32_isa.c
         src/pw_ia32_decode.c"
@@ -124,7 +124,7 @@ declare -A sources=(
     [test_pw_ia32_interp]="src/pw_ia32_isa.c src/pw_ia32_decode.c src/pw_ia32_interp.c"
     [test_wine_fault_served]=""
     [test_wine_virtual_guard]=""
-    [test_crash_replays]="tests/fake_ps5_kernel.c wine/ps5/pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem.c wine/ps5/pw_wine_heap.c
+    [test_crash_replays]="tests/fake_ps5_kernel.c wine/ps5/pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem.c wine/ps5/pw_wine_heap.c wine/ps5/pw_wine_dmap.c
         wine/ps5/pw_wine_pages.c wine/ps5/pw_wine_pages_ps5.c wine/ps5/pw_wine_vm.c wine/ps5/pw_wine_prx.c wine/ps5/pw_wine_alias.c
         wine/ps5/pw_wine_mmu4k_ps5.c wine/ps5/pw_wine_mmu4k.c wine/ps5/pw_wine_mmu4k_slot.S src/pw_ia32_isa.c src/pw_ia32_decode.c
         wine/ps5/pw_wine_perf.c .deps/graphics-foundation/tooling/gpu-broker/client.c"
