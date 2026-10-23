@@ -96,6 +96,7 @@ declare -A sources=(
     [test_pw_status_note]=""
     [test_pw_dcomp_stub]=""
     [test_pw_umip]=""
+    [test_pw_wow_loader]=""
     [test_syscall_numbers]=""
     [test_pw_pipe_memory]="src/pw_pipe_memory.c"
     [test_pw_memory_guard]="src/pw_memory_guard.c"
