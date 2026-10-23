@@ -1,3 +1,45 @@
+## Emulate ntdll syscall and int 2e (2026-10-23, no console run)
+
+1253 was installed and the hashes match the table in the next section: `ntdll.dll` `63b7dab8`, `ntdll.prx.elf` `dfbe8186`, `ntdll.prx` `db0a6ff0`. WoW shows Launching and returns to Play. The newest Crash.txt is still `_classic_beta_` `15.45.38`. wine-child 1087 and 1088 are the two WowB processes. They carry the same two lines, then the process ends. The exit tally is `conversions=1066` `converted_kib=17056` `convert_failed=0` `exec_refused=0` and `mmu4k total runs=0`.
+
+`wine-ps5: image-writecopy addr=dfffd68340 vprot=0x25 hostv=0xa5 prot=0x7` fires twice. That address is the first byte of `NtSetIoCompletion`. The page byte on the following fault is `0xa7` (`COPIED|COMMITTED|WRITE|EXEC|READ`) and `unix=0x7`. The `kernel32+0x110e4` store does not fault.
+
+Before that write, two calls return through the existing dispatcher:
+
+`wine-ps5: status 0xc0000024 syscall=NtSetIoCompletion id=0x1a3 arg2=… caller=0xdfffd6835f handle=0xffffffffffffffff guest=0xdfffa2faea type=Process`
+
+`caller` is `ntdll+0x5835f`, the `ret` after `call qword ptr [0x7ffe1000]`. `KUSER_SHARED_DATA.SystemCall` is initialized to 1, and that bit selects this path. The status is the stock `STATUS_OBJECT_TYPE_MISMATCH` for `NtCurrentProcess`.
+
+The fault after the write is one line:
+
+`wine-ps5: access-fault trap=0x9 err=0 pc=dfffd68354 ntdll.dll+0x58354 ctx=dfffd68354 exc=dfffd68354 access=read info0=0 fault=ffffffffffffffff bytes=c3eb01c3ff14250010fe7fc34c8bd1b8 pcview=… image vprot=0xa7 hostv=0xa7 unix=0x7 bt=- sigrsp=dfffa2faea ctxrsp=dfffa2faea rcx=0xdfffd68354 rdx=0`
+
+Signal pc, context RIP and `ExceptionAddress` match. Trap 9 with error 0 is `#GP(0)`. Wine's general-protection path reports a read of `0xffffffffffffffff` and leaves RIP on the faulting instruction. The 16 bytes are the file bytes at RVA `0x58354`. The stub at `0x58340` is the Windows 10 sequence: `mov r10, rcx`; `mov eax, 0x1a3`; `test byte ptr [0x7ffe0308], 1`; `jne +3`; `syscall`; `ret`; `jmp +1`; `ret`; `call qword ptr [0x7ffe1000]`; `ret`. RVA `0x58352` is `0f 05`. RVA `0x58354` is the `ret` after it. `rcx` equals that RIP, which is the value the CPU writes when `syscall` completes. Prospero ran the Windows number and returned to the `ret`. The `ret` then raised `#GP(0)` because `rsp` is `0xdfffa2faea`. That address is the `guest` field of the two calls above. It is outside the thread stack `0x1000200000`–`0x1000210000`, and it is not 8-aligned. SEH logs `invalid frame 000000DFFFA2FAEA` and `Exception frame is not in stack limits`. The thread is killed. `payload doom seen reason=exit stamped_ms_ago=43 due_in_ms=19957` is followed at once by `payload terminal reason=control-ended … revents=0x10`. The exit is this fault. The 20 second timer did not elapse.
+
+The 15.45 store at this same address wrote byte `0x5c` (`mov [rax], cl`, `rcx=0x5c`). `0x5c` is `pop rsp`. Replacing the first byte of `4c 8b d1` yields `pop rsp`; `mov edx, ecx`, and the rest of the stub, including `syscall`, stays. `pop rsp` loads the guest return address into `rsp`. The bytes at `+0x14` match the file, so that write did not replace the tail. This run's `image-writecopy` line does not record the stored byte. The smashed `rsp` is what that byte produces.
+
+Patch 1254 stops `syscall` from entering the Prospero kernel and dispatches the fault through the existing table. `load_ntdll` rewrites each `75 03 0f 05` in an executable section of `ntdll.dll` to `75 03 cd 2e`. This image has 258 of those sites, one per service-table entry. Fifteen other `0f 05` bytes in `.text` are the tail of a displacement and the next opcode, and they stay. `int 2e` is two bytes, so `jne +3` still skips it and reaches `call [0x7ffe1000]` while `SystemCall` bit 0 is set. The initializer stays 1. A stub that sees 0 executes `int 2e`. On `SIGSEGV`, `SIGILL` or `SIGTRAP`, the bytes `0f 05` or `cd 2e` inside `ntdll.dll`, and not in the 32-bit code segment, enter `__wine_syscall_dispatcher` at `prolog_end`. `eax` is the 19045 id. `r10` is the first argument. `[rsp+0x28]` is the fifth. The dispatcher subtracts `0xb` from `frame->rip`, so the frame is given `rip+2+0xb` and the stub's own `ret` runs with the status in `rax`. The `0xC0000024` tracer is that return. When `rsp` is not an 8-aligned address inside the thread stack, the handler looks for that qword in the stack and puts `rsp` there before the dispatcher runs, so the `ret` has a frame. The prefix `5c 8b d1` at `rip-0x12` means `mov r10, rcx` did not run, and `r10` is taken from `rcx`. At most 32 lines a process:
+
+`wine-ps5: syscall-emu id=… op=… rip=… rsp=… r10=… rcx=… rdx=… prefix=… restored=… slots=…`
+
+A stack that cannot be recovered writes at most 8 `wine-ps5: syscall-emu skip` lines and the access fault is still delivered. One line names the rewrite:
+
+`wine-ps5: syscall-arm ntdll count=…`
+
+258 is the count when every site is writable. The access-fault, image-protect, image-write and image-writecopy lines stay. Forcing `SystemCall` to 0 while `0f 05` still reached the kernel would send every Windows number into Prospero. The rewrite makes the image's `syscall` into `int 2e`, and both encodings are emulated when they fault. A successful emulation should keep the process past this `#GP` when the stack is still valid at the stub's `ret`, or when the popped return address is still in the thread stack. That is a hypothesis. This build was not run on a console, and the return to Play is not claimed gone.
+
+Syscall numbers stay the 19045 table. The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The compare of protocol `0x3a3` is still the one instruction `81 fe a3 03 00 00`, now at VA `0x35f70`. `movl $0x3a3, %edx` is still the one instruction `ba a3 03 00 00`, now at VA `0x36284`. Both moved `0x10` with the `ps5_arm_ntdll_syscalls` call in `loader.c`. `.text` holds the dword `a3 03 00 00` three times: those two immediates, and the displacement of a `je` at VA `0x90453` (`0f 84 a3 03 00 00`). That `je` was at `0x8fd73` in the 1253 image. The whole file holds the dword 31 times. Twenty-six of the rest are in `.debug_loc` (18), `.debug_info` (3), `.debug_ranges` (3), `.debug_aranges` (1) and `.debug_line` (1). `.debug_ranges` gained one. The other two sit in `.dynsym` and `.symtab`. The PE image was not rebuilt: `SizeOfImage` stays `0x2d5000`, the file stays 3,211,264 bytes, hash `63b7dab8`. wineserver was not rebuilt. The 32-bit ntdll and wow64 were not rebuilt.
+
+Install the new unix files with the `63b7dab8` `ntdll.dll`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `63b7dab8c8e872cb375a0d051c5b8eb97ec744e88f31a0ea229c1f6e7f1bd3e4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,438,532 | `e21e5c4d3f74d90bb7ba13cb81f6283e238dd9bb684e2acb5d63dec1715ebc99` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,223,378 | `a706e7899ec620a4a7a9f62fd35f2204b494b9b93fe21615b1b8b589a02cdb62` |
+
+The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,908,768 bytes, `a1f96318faa36a1e35d1bf22de4795827d03009f7a7cc2e51d09b78c55a37486`.
+
 ## Writable copy of an exec-converted image page (2026-10-23, no console run)
 
 1252 was installed and the hashes match the table in the next section: `ntdll.dll` `63b7dab8`, `ntdll.prx.elf` `7038bb30`, `ntdll.prx` `703f7cbc`. Crash.txt `_classic_beta_` `15.45.38` is the same line: `ACCESS_VIOLATION (Failed to write address 0x000000DFFDB67E3B at instruction 0x000000DFFFD638C0)`. wine-child 1040 is the WowB process. It ends at `conversions=1067` `converted_kib=17072` `convert_failed=0` `exec_refused=0` and `mmu4k total runs=0`. There is no `execute-fault` line. Signal pc, context RIP and `ExceptionAddress` match on every access-fault line, so the signal path is not inventing the RIP.
