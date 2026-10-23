@@ -92,6 +92,7 @@ declare -A sources=(
     # Graphics patch 0018's staging.h, from the applied foundation (setup-graphics-foundation.sh, above).
     [test_pw_gpu_staging]=""
     [test_pw_fd_census]="src/pw_fd_census.c"
+    [test_pw_file_query]=""
     [test_pw_pipe_memory]="src/pw_pipe_memory.c"
     [test_pw_memory_guard]="src/pw_memory_guard.c"
     [test_pw_memory_policy]="src/pw_memory_policy.c"

@@ -507,3 +507,11 @@ process that took the desktop window did it: a menu builder, a console host, an 
 dialog each held a 40-43 MiB Unix heap where a process without it held 9 MiB (the Pro, 2026-10-20).
 The desktop window now carries the mode last published (width, height, rate), and a process publishes only when its
 own differs, so the last rate still wins as patch 1187 describes; the others read the display from the registry.
+
+Patch 1242 makes a parked file answer file queries as the file. An idle file's descriptor is a socket
+(`pw_wine_fdv.h`). `open_fd` then stored no inode and no unix name, `file_get_fd_type` returned `FD_TYPE_CHAR`, and
+`get_handle_unix_name`, `set_fd_name`, `set_fd_disposition`, `file_open_file` and `NtCreateFile` by file id wrote
+`STATUS_OBJECT_TYPE_MISMATCH` (`0xC0000024`) into an `IO_STATUS_BLOCK`. Stock Wine stats the path and returns the
+file's times, size and name for `FileBasicInformation`, `FileStandardInformation`, `FileNameInformation` and
+`FileAllInformation`. A real socket, fifo or device is unchanged, as are ntsync objects, consoles and d3dkmt.
+`wine/ps5/pw_wine_file_query.h`, host test `tests/test_pw_file_query.c`. No console run.

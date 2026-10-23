@@ -437,9 +437,11 @@ done
 # Wine's makedep resolves unlisted headers beside the including source, independently
 # of compiler CFLAGS. Install the repository-owned interface headers as build
 # inputs; implementation stays in wine/ps5, never edited in the vendor tree.
-for header in pw_wine_section.h pw_wine_section_ps5.h pw_wine_alias.h pw_wine_mmu4k.h; do
+for header in pw_wine_section.h pw_wine_section_ps5.h pw_wine_alias.h pw_wine_mmu4k.h pw_wine_file_query.h; do
     cp -p "$root/wine/ps5/$header" "$tree/dlls/ntdll/unix/$header"
 done
+# Patch 1242: open_fd and the file-id lookup include the same decision as ntdll.
+cp -p "$root/wine/ps5/pw_wine_file_query.h" "$tree/server/pw_wine_file_query.h"
 cp -p "$root/wine/ps5/pw_wine_perf.h" "$tree/dlls/winedmo/pw_wine_perf.h"   # patch 2065's media counters
 cp -p "$root/src/pw_window_snapshot.h" "$tree/server/pw_window_snapshot.h"
 cp -p "$root/wine/ps5/pw_wine_cursor.h" "$tree/server/pw_wine_cursor.h"
