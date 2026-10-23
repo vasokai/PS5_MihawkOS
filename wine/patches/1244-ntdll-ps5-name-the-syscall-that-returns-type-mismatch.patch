@@ -1,0 +1,160 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] ntdll: PS5: name the syscall that returns STATUS_OBJECT_TYPE_MISMATCH
+
+WoW Classic's loader dies in RtlTimeToTimeFields reading 0xC0000024, which is
+STATUS_OBJECT_TYPE_MISMATCH zero-extended to a LARGE_INTEGER pointer. The
+parked-file mismatch lines did not fire, so that status did not come from the
+logged NtQueryInformationFile, NtSetInformationFile, NtCreateFile or NtOpenFile
+paths. Every other Nt* return of the same status (handle type checks,
+NtQueryObject, volume and directory queries, ntsync, sockets) reaches
+__wine_syscall_dispatcher_return. That path now writes one line, at most 48
+per process:
+
+wine-ps5: status 0xc0000024 syscall=%s id=%#x arg2=%#llx caller=%#llx
+
+caller is the guest return address. The name is the ntdll syscall. A win32u id
+is logged as ?.
+
+get_thread_times had no Prospero implementation, so NtQueryInformationThread
+ThreadTimes returned success with zero CPU times and printed a fixme. The
+current process uses getrusage(RUSAGE_SELF) and the current thread uses
+RUSAGE_THREAD. Another thread or process stays at zero. The times() fallback
+requires a positive tick rate and a successful call. That call does not return
+0xC0000024. No console run.
+---
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 1309f6f..26d1705 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -3063,4 +3063,42 @@ void ps5_extend_syscall_args( UINT mask, ULONG_PTR *args )
+         else if (mask & (1u << (16 + i))) args[i] &= 0xffff;
+     }
+ }
++
++#include "pw_wine_status.h"
++
++/* ntsyscall_names is the unix build's ALL_SYSCALLS list (the 32-bit numbers). Shared ntdll
++ * services use the same number in the 64-bit list. A win32u id (table 1) has no length here. */
++static const char *ps5_syscall_name( unsigned int id )
++{
++    unsigned int idx = (id >> 12) & 3;
++    unsigned int num = id & 0xfff;
++    if (idx == 0 && num < ARRAY_SIZE(ntsyscall_names))
++        return ntsyscall_names[num];
++    return NULL;
++}
++
++/* Called from __wine_syscall_dispatcher_return with the status still in rax.
++ * caller is frame->rip, which the prolog already moved 0xb below the guest return.
++ * The sink can re-enter a syscall; depth stops that from logging itself. */
++void ps5_note_type_mismatch( UINT id, ULONG_PTR arg2, ULONG_PTR caller )
++{
++    static unsigned int depth, lines;
++    char line[192];
++    int len;
++
++    if (__atomic_fetch_add( &depth, 1, __ATOMIC_RELAXED ))
++    {
++        __atomic_fetch_sub( &depth, 1, __ATOMIC_RELAXED );
++        return;
++    }
++    if (__atomic_fetch_add( &lines, 1, __ATOMIC_RELAXED ) < 48)
++    {
++        len = pw_status_mismatch_line( line, sizeof(line), ps5_syscall_name( id ), id,
++                                       (unsigned long long)arg2,
++                                       (unsigned long long)caller + 0xb );
++        if (len > 0)
++            wine_write_stderr( line, len < (int)sizeof(line) ? len : (int)sizeof(line) - 1 );
++    }
++    __atomic_fetch_sub( &depth, 1, __ATOMIC_RELAXED );
++}
+ #endif
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index b0a987a..0207149 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -4174,6 +4174,21 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+ #ifdef __PROSPERO__
+                    "cmpl $0,0x3e0(%r13)\n\t"     /* thread_data->ps5_terminating */
+                    "jnz " __ASM_NAME("ps5_dispatcher_terminate") "\n\t"
++                   /* Every Nt* return comes through here, including ps5_narrow_syscall.
++                    * 0xC0000024 is STATUS_OBJECT_TYPE_MISMATCH. Name the syscall before
++                    * the guest sees it. Two pushes keep the call aligned; rax and rcx
++                    * are the status and the frame, and the epilogue reloads rsp from rcx. */
++                   "cmpl $0xc0000024,%eax\n\t"
++                   "jne " __ASM_LOCAL_LABEL("ps5_type_mismatch_done") "\n\t"
++                   "pushq %rax\n\t"
++                   "pushq %rcx\n\t"
++                   "movl 0xb0(%rcx),%edi\n\t"    /* frame->syscall_id */
++                   "movq 0x18(%rcx),%rsi\n\t"    /* rdx saved at entry: 2nd argument */
++                   "movq 0x70(%rcx),%rdx\n\t"    /* frame->rip, 0xb before the guest return */
++                   "call " __ASM_NAME("ps5_note_type_mismatch") "\n\t"
++                   "popq %rcx\n\t"
++                   "popq %rax\n\t"
++                   __ASM_LOCAL_LABEL("ps5_type_mismatch_done") ":\n\t"
+ #endif
+                    /* push rbp-based kernel stack cfi */
+                    __ASM_CFI(".cfi_remember_state\n\t")
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 2282575..fbbd6b4 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -78,6 +78,8 @@
+ #include "unix_private.h"
+ #ifdef __PROSPERO__
+ #include "wine/ps5_ntsync.h"
++#include <sys/resource.h>
++#include <pthread_np.h>
+ #endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(thread);
+@@ -2132,6 +2134,34 @@ BOOL get_thread_times(int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time, LA
+     }
+     procstat_close(pstat);
+     return ret;
++#elif defined(__PROSPERO__)
++    {
++        struct rusage ru;
++        int who;
++
++        /* Another process has no rusage from here. The caller leaves those times at zero. */
++        if (unix_pid == -1 || unix_pid != getpid())
++            return FALSE;
++        if (unix_tid == -1)
++            who = RUSAGE_SELF;
++        else
++        {
++#ifdef HAVE_PTHREAD_GETTHREADID_NP
++            if (pthread_getthreadid_np() != unix_tid)
++                return FALSE;
++#else
++            return FALSE;
++#endif
++            who = RUSAGE_THREAD;
++        }
++        if (getrusage( who, &ru ))
++            return FALSE;
++        kernel_time->QuadPart = (ULONGLONG)ru.ru_stime.tv_sec * 10000000 +
++            (ULONGLONG)ru.ru_stime.tv_usec * 10;
++        user_time->QuadPart = (ULONGLONG)ru.ru_utime.tv_sec * 10000000 +
++            (ULONGLONG)ru.ru_utime.tv_usec * 10;
++        return TRUE;
++    }
+ #else
+     static int once;
+     if (!once++) FIXME("not implemented on this platform\n");
+@@ -2350,9 +2380,11 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
+                 struct tms time_buf;
+                 long clocks_per_sec = sysconf(_SC_CLK_TCK);
+ 
+-                times(&time_buf);
+-                kusrt.KernelTime.QuadPart = (ULONGLONG)time_buf.tms_stime * 10000000 / clocks_per_sec;
+-                kusrt.UserTime.QuadPart = (ULONGLONG)time_buf.tms_utime * 10000000 / clocks_per_sec;
++                if (clocks_per_sec > 0 && times(&time_buf) != (clock_t)-1)
++                {
++                    kusrt.KernelTime.QuadPart = (ULONGLONG)time_buf.tms_stime * 10000000 / clocks_per_sec;
++                    kusrt.UserTime.QuadPart = (ULONGLONG)time_buf.tms_utime * 10000000 / clocks_per_sec;
++                }
+             }
+             if (data) memcpy( data, &kusrt, min( length, sizeof(kusrt) ));
+             if (ret_len) *ret_len = min( length, sizeof(kusrt) );

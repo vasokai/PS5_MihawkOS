@@ -1,5 +1,32 @@
 # Plan
 
+## WoW Classic still reads 0xC0000024 (2026-10-23, no console run)
+
+The df80e81 ntdll pair below is installed and hash-checked. Battle.net's dashboard loads. WoW Classic Era and Classic beta still die on Play with `ACCESS_VIOLATION` reading `0x00000000C0000024`. Both Crash.txt files (era 10:29:55, beta 10:29:39) name the same instruction, `0xDFFFFA5903`. The module map puts that address in `ntdll.dll` (base `0xDFFFF40000`, size `0xb0000`), offset `0x65903`. `WowClassic_loader.dll` is at `0xDFFBF50000` and ends at `0xDFFE190000`, so the faulting instruction is not in the loader. `RtlTimeToTimeFields` (`dlls/ntdll/time.c`) reads `liTime->QuadPart` first. A read of address `0xC0000024` means that pointer is `STATUS_OBJECT_TYPE_MISMATCH` zero-extended. `FileTimeToSystemTime` dereferences the `FILETIME` before calling it, so the loader called `RtlTimeToTimeFields` directly. The PE `ntdll.dll` was not rebuilt. The unix ntdll is what can stop the status being returned. The offset was not confirmed by disassembly of a built PE.
+
+The attached session logs have zero `wine-ps5: file mismatch` lines. Patches 1242 and 1243 are in this ntdll (the pair that fixed the dashboard). Those lines cover `NtQueryInformationFile`, `NtSetInformationFile`, `NtCreateFile` and `NtOpenFile`. This run's `0xC0000024` did not come from those paths.
+
+`get_object_name` does not add a type mismatch of its own: it calls `get_handle_obj` with a NULL type, and `no_get_full_name` returns NULL without setting the status. The other `STATUS_OBJECT_TYPE_MISMATCH` sites are the stock checks (`get_handle_obj`'s type, `no_get_fd`, `no_fd_get_volume_info`, ntsync, consoles, `ENOTSOCK`, `no_lookup_name`). Those match Windows when the handle is the wrong kind. They are not changed.
+
+Beta's child log prints `fixme:thread:get_thread_times not implemented on this platform` about 360 ms before the process is killed. That function returns FALSE. `NtQueryInformationThread(ThreadTimes)` still returns `STATUS_SUCCESS`, with CPU times left at zero except the current thread, which fell back to `times()`. The fixme is not the status the loader dereferenced. Era's child has the same Crash.txt and does not print that fixme in the captured 30 s. Thread times on Prospero now come from `getrusage`: `RUSAGE_SELF` for this process, `RUSAGE_THREAD` when the tid is this thread. Another thread or process stays at zero. The `times()` fallback requires a positive tick rate and a successful `times()` call.
+
+Every syscall return of `0xC0000024` now writes one line, at most 48 per process. The normal return, the narrow-argument return, the traced return and `bad_syscall` all pass the check. The linked dispatcher compares `%eax` with `0xc0000024` and calls `ps5_note_type_mismatch`:
+
+`wine-ps5: status 0xc0000024 syscall=%s id=%#x arg2=%#llx caller=%#llx`
+
+`caller` is the guest return address (frame rip plus `0xb`). `arg2` is the second syscall argument saved at entry. The name is the ntdll syscall table; a win32u id is `?`. This is the line the next run uses to name the `Nt*`. Host test `test_pw_status_note` passed. Not run on a console.
+
+Replace both ntdll files together. The wineserver pair is unchanged from the dashboard install. The `--no-opengl` `win32u` is not a replacement for the title's OpenGL `win32u.prx.elf`.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,419,924 | `bb38f0d729ffbe1f996ebed2eef44025a86c212ecbbbd34eee19817e1e96d9a5` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,199,330 | `b5f2494b7f1d792628f4e357ecc6e44664d7f283896d46cab07a4bfde05a8d52` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/wineserver.prx.elf` | 1,016,676 | `9eae690322a7d8eb7a06d7ccb93cfb14a6d2b0021af48085c88e9f322341c3b4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/wineserver.prx` | 828,779 | `68209da4c00fc572ea51b8f11d4d42d9b5216b1681d7513b38b6456c03a91f48` |
+
+Build products: `.deps/wine-ps5/prx/ntdll.elf` (stage as `ntdll.prx.elf`) and `.deps/wine-ps5/prx/sce_module/ntdll.prx`. The pair that loaded the dashboard is `ntdll.prx.elf` `473a91f13f608da09e784fa0842ea8f55597d64317344ebed7dcaf176cc7b561` and `ntdll.prx` `daf47dd3899ffaaecb8b2d080226be65179a1b9af350dc194adfec6c718ba3db`.
+
 ## Battle.net dashboard crash after the firmware-12 ntdll (2026-10-23, no console run)
 
 The four files from the section below were installed and hash-checked at 09:50. Battle.net then died as the dashboard loaded (`Unhandled exception 0xe0000008` in thread `4ac` at `7BC33039`). Before that install, Battle.net ran and only WoW crashed. Session 0 `wine-child-208.log` / `wine-child-209.log` are the crashing helper.
