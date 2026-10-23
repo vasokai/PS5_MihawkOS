@@ -1,3 +1,33 @@
+## Access-fault log for the RtlEqualPrefixSid write (2026-10-23, no console run)
+
+5653f96 was installed and the hashes match the table in the next section: `ntdll.dll` `63b7dab8`, `ntdll.prx.elf` `0ff63726`, `ntdll.prx` `88d99515`. Both WowB Crash.txt lines write `WowB_loader+0x2017E3B` from ntdll+`0x538C0`, the first byte of `RtlEqualPrefixSid`. The file bytes there are `66 90 55 56 48 83 ec 38 48 8d 6c 24 30 48 89 4d 00`. `66 90` is the hotpatch NOP. The body reads both SIDs and calls `memcmp`. wine-child 869 and 871 end at `conversions=1067` `mmu4k total runs=0` and have no `illegal-instruction`, `vectored-handler` or `execute-fault` line. Two readings of that RIP are still open. The bytes at that address in the running process can differ from the file, because a hotpatch NOP is where a loader places a `jmp`. The instruction Crash.txt prints is `ExceptionAddress`, and it can differ from the signal frame's pc.
+
+Patch 1252 only logs. An access violation about to be delivered writes one line, at most 32 a process:
+
+`wine-ps5: access-fault trap=… err=… pc=… <module+RVA> ctx=… exc=… access=… info0=… fault=… <module+RVA> bytes=… pcview=… faultview=… bt=… sigrsp=… ctxrsp=… rcx=… rdx=…`
+
+`pc` is the signal frame's RIP. `ctx` is the `CONTEXT` RIP. `exc` is `ExceptionAddress`, the instruction Crash.txt prints. `bytes` are 16 bytes at `pc`. `pcview` and `faultview` name the view base, size, allocation flags and kind (`image`, `file`, `valloc` or `map`), the page byte, the host page byte and the unix protection, or `noview` with those three bytes. `bt` is the return address at `[rsp]` and up to six RBP frames, each as module+RVA. The record, the RIP and the protections stay as they were.
+
+`NtProtectVirtualMemory` and `NtWriteVirtualMemory` write one line when the range overlaps `ntdll.dll` or `WowB_loader.dll` in the current process. The two lines share one cap of 64 a process:
+
+`wine-ps5: image-protect which=… addr=… size=… new=… old=… status=… from=…`
+
+`wine-ps5: image-write which=… addr=… size=… status=… written=… from=…`
+
+`which` is the module and RVA when the address sits inside the image, or `module+overlap` when only the range crosses it. `size` on a protect is the size the caller passed, before rounding. `from` is the unix return address of the Nt call. The status, the pointers and the old protection are what the call returned before.
+
+Syscall numbers stay the 19045 table. The checker exits 0. `--self-test` prints `NtFlushInstructionCache=0xe9 NtSetIoCompletion=0x1a3`. `--ntsyscalls`, `--pe` and `--unix` each print `257 match Windows, 258 entries, 1 Wine-only, 216 Windows holes, max id 0x1d9`. The compare of protocol `0x3a3` is still the one instruction `81 fe a3 03 00 00`. `movl $0x3a3, %edx` is still the one instruction at VA `0x36274`. `.text` still holds the dword `a3 03 00 00` four times. The whole file holds it 31 times. Twenty-five of the rest are in `.debug_loc`, `.debug_info`, `.debug_ranges`, `.debug_aranges` and `.debug_line`. `.debug_loc` shares `.bss`'s file offset, and `.bss` itself is `NOBITS`. The other two sit in `.dynsym` and `.symtab`, across a symbol-table field boundary. The PE image was not rebuilt: `SizeOfImage` stays `0x2d5000`, the file stays 3,211,264 bytes, hash `63b7dab8`. This was not run on a console. The write stays the Crash.txt line until the next run's `access-fault` line names the signal pc, the 16 bytes and the page byte.
+
+Install the new unix files with the `63b7dab8` `ntdll.dll`. wineserver was not rebuilt.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-windows/ntdll.dll` | 3,211,264 | `63b7dab8c8e872cb375a0d051c5b8eb97ec744e88f31a0ea229c1f6e7f1bd3e4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx.elf` | 1,421,940 | `7038bb307b4623103f50ad2f1b5b404c0ddfa7432db7b86c78d85db0037b25f1` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/ntdll.prx` | 1,217,714 | `703f7cbcbb3281b9de2f3c3bdee06c605a52ca913766cc159a49aa498cf9d088` |
+
+The unstripped check image is `.deps/wine-ps5/prx/ntdll.shared.elf`, 3,877,448 bytes, `13426f1c644dbe002f947641255989b06ed61cbb07f221f1739dba59298fd199`.
+
 ## Write into WowB_loader from RtlEqualPrefixSid (2026-10-23, console of 5653f96)
 
 5653f96 was installed and the hashes match the table in the next section: `ntdll.dll` `63b7dab8`, `ntdll.prx.elf` `0ff63726`, `ntdll.prx` `88d99515`. Crash.txt for `_classic_beta_` `15.16.43` and `15.16.49` are the same line: `ACCESS_VIOLATION (Failed to write address 0x000000DFFDB67E3B at instruction 0x000000DFFFD638C0)`. The hash block is empty. ntdll in that list is base `000000DFFFD10000`, size `002d5000`, timestamp 1792760243, this image. `WowB_loader.dll` is base `000000DFFBB50000`, size `02810000`. The target RVA is `0x2017E3B`. The instruction RVA is `0x538C0`.
