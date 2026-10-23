@@ -1,3 +1,24 @@
+## DirectComposition stubs return a status (2026-10-23, no console run)
+
+1258 was installed (`ntdll.prx.elf` `bda8c378`, `ntdll.prx` `507a8603`, `ntdll.dll` `63b7dab8`) and Mihawk's desktop came up. WoW passed the loader's `NtSetIoCompletion` probe. WowB then aborted three times, from several threads, with `wine: Call from 000000DFFFD68357 to unimplemented function win32u.NtDCompositionCommitSynchronizationObject, aborting`. BlizzardError.exe started and wrote `errors/2026-10-23 18.49.30`.
+
+That address is the guest RIP `stub_syscall` copies out of the thread context. The function is the unix stub in `dlls/win32u/syscall.c`. A `@ stub -syscall` entry raises `EXCEPTION_WINE_STUB`, and `dispatch_exception` prints that line and aborts. Upstream Wine and this tree's Proton pin do the same. The export is already in `win32u.spec`, syscall id `0x1010`, argument bytes 0. Windows 10 build 19045 (22H2) has 139 DirectComposition, Dxgk, flip and composition-surface names. All 139 are already in this spec. None were added, and `win32u.dll` was not rebuilt.
+
+164 of the 1059 syscall stubs now return a status instead of raising. The set is every `NtDxgk*`, every `NtFlipObject*`, every name containing `Composition`, and `NtVisualCaptureBits`. `NtDCompositionCommitSynchronizationObject` is in that set and returns `STATUS_SUCCESS` (`0`): a commit with no compositor waiting on the object is finished. A name containing Create, Open, Duplicate, Query, Get, Enum, Check, Is, Capture or Read returns `STATUS_NOT_IMPLEMENTED` (`0xC0000002`) so the caller does not consume an unwritten handle or buffer. The other names in the set return `STATUS_SUCCESS`. Each call writes one line, at most 32 a process: `wine-ps5: dcomp-stub %s status=%08x`. `NtUser` and `NtGdi` stubs that are outside the set still abort. The 32-bit `wow64win` wrapper still raises; it was not rebuilt. WowB is the 64-bit process, and it takes the unix table.
+
+1258 is unchanged. `ntdll.prx.elf` is still `bda8c378` (1,438,628 bytes). After `path=int2e`, every 64-bit ntdll thunk still executes `int 2e`. Syscall numbers stay the 19045 table. The compare of protocol `0x3a3` still occurs 42 times in the ntdll image. This unix win32u was linked the same way as the image already in this tree: `NEEDED` is `ntdll.prx`, `libSceLibcInternal.sprx` and `libkernel.sprx`. The PS5 OpenGL SDK is not in this environment, so this file does not contain it.
+
+This build was not run on a console. The abort is not claimed gone.
+
+Install the two new unix files. Leave `win32u.dll` and the 1258 ntdll files.
+
+| Console path | Bytes | SHA-256 |
+| --- | --- | --- |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/win32u.prx.elf` | 2,473,676 | `55313ff22cc542c95cd3c2ee177d6ecacf0a0dd3065e570b2cff1b5c78f54ec4` |
+| `/data/ps5proton/runtime/ge11-7/lib/wine/x86_64-unix/win32u.prx` | 2,192,546 | `b5bf20048df18e208a37884527d2c05fb72bd079a45c0420b9a84ee930c9a867` |
+
+The unstripped check image is `.deps/wine-ps5/prx/win32u.shared.elf`, 8,745,472 bytes, `0374a2ec4e2ae3b64a1e15785dfdd5ebf827d1991b77cda45c67992ca7453568`. `win32u.so` is 8,761,584 bytes, `4015f98c8d7ea2621b9241e64eed377d751047d6e2bffe46ac2e23c3100e758b`.
+
 ## int 2e resumes on every thread (2026-10-23, no console run)
 
 1257 was installed and the hashes match the table in the next section: `ntdll.prx.elf` `a094f685`, `ntdll.prx` `a56da7ff`, `ntdll.dll` `63b7dab8`. Mihawk's desktop appeared, then the process crashed. `syscall-int2e ntdll armed=258 ... path=int2e reason=syscall-collides` is present, and hundreds of `syscall-emu ... op=cd2e restored=0` resumed. The faults that ended it are `#GP` with error `0x172` (IDT vector `0x2e`) delivered as a read of `0xffffffffffffffff`:

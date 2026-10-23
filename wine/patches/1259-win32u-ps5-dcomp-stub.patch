@@ -1,0 +1,72 @@
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Subject: [PATCH] win32u: PS5: DirectComposition stubs return a status
+
+Wine raises EXCEPTION_WINE_STUB for a @ stub -syscall and the process
+aborts. Windows 10 build 19045 already exports these names. A
+DirectComposition, Dxgk or flip stub now returns a status. The commit
+WowB reached returns STATUS_SUCCESS. Creates and queries return
+STATUS_NOT_IMPLEMENTED. Other win32u stubs still abort. No console run.
+---
+--- a/dlls/win32u/syscall.c
++++ b/dlls/win32u/syscall.c
+@@ -23,6 +23,7 @@
+ #endif
+ 
+ #include <stdarg.h>
++#include <stdio.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -33,10 +34,23 @@
+ #include "ntuser.h"
+ #include "wine/unixlib.h"
+ #include "win32syscalls.h"
++#include "pw_wine_dcomp.h"
+ 
+ ULONG_PTR zero_bits = 0;
+ 
+-static void stub_syscall( const char *name )
++#ifdef __PROSPERO__
++/* One line per call, at most 32 a process. The name is the stub, and the
++ * status is what the guest receives in eax. */
++static void ps5_log_dcomp_stub( const char *name, unsigned status )
++{
++    static unsigned lines;
++
++    if (++lines > 32) return;
++    fprintf( stderr, "wine-ps5: dcomp-stub %s status=%08x\n", name, status );
++}
++#endif
++
++static NTSTATUS stub_syscall( const char *name )
+ {
+     CONTEXT context = { .ContextFlags = CONTEXT_FULL };
+     EXCEPTION_RECORD rec =
+@@ -47,6 +61,15 @@
+         .ExceptionInformation[0] = (ULONG_PTR)"win32u",
+         .ExceptionInformation[1] = (ULONG_PTR)name,
+     };
++#ifdef __PROSPERO__
++    if (pw_dcomp_stub_applies( name ))
++    {
++        unsigned status = pw_dcomp_stub_status( name );
++
++        ps5_log_dcomp_stub( name, status );
++        return status;
++    }
++#endif
+     NtGetContextThread( GetCurrentThread(), &context );
+ #ifdef __i386__
+     rec.ExceptionAddress = (void *)context.Eip;
+@@ -56,9 +79,10 @@
+     rec.ExceptionAddress = (void *)context.Pc;
+ #endif
+     NtRaiseException( &rec, &context, TRUE );
++    return STATUS_NOT_IMPLEMENTED;
+ }
+ 
+-#define SYSCALL_STUB(name) static void name(void) { stub_syscall( #name ); }
++#define SYSCALL_STUB(name) static NTSTATUS name(void) { return stub_syscall( #name ); }
+ ALL_SYSCALL_STUBS
+ 
+ static ULONG_PTR syscalls[] =
