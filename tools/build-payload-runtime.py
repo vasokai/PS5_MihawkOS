@@ -45,7 +45,9 @@ def main():
  lines=[l for l in text.splitlines() if '-o dlls/ntdll/ntdll.so ' in l]
  objects=[base/'build'/v for v in shlex.split(lines[-1]) if v.endswith('.o') and not v.startswith('/')]
  objects += [dmem_obj if n=='pw_wine_dmem_ps5' else base/'heap'/f'{n}.o' for n in ('pw_wine_heap','pw_wine_heap_libc','pw_wine_dmem','pw_wine_dmem_ps5','pw_wine_section','pw_wine_section_ps5','pw_wine_alias','pw_wine_mmu4k','pw_wine_mmu4k_slot','pw_wine_mmu4k_ps5','pw_ia32_isa','pw_ia32_decode')]
- names=('pw_ntsync','pw_wine_ntsync','pw_wine_process','pw_wine_process_io','pw_wine_threads','pw_wine_prx','pw_wine_dl','pw_wine_dl_libc','pw_wine_compat','pw_wine_compat_libc','pw_wine_sink','pw_audio_ring','pw_memory_helper','pw_memory_service','pw_wine_perf','pw_wine_cwd','pw_wine_cwd_libc','pw_wine_fdv','pw_wine_fdv_libc','ntdll_desc')
+ # The same shims the ntdll link in tools/build-wine-ps5.sh adds on top of ntdll.so. The prebuilt objects
+ # come from the pinned base; the files this relink recompiles are substituted below.
+ names=('pw_ntsync','pw_wine_ntsync','pw_wine_process','pw_wine_process_io','pw_wine_threads','pw_wine_prx','pw_wine_dl','pw_wine_dl_libc','pw_wine_compat','pw_wine_compat_libc','pw_wine_net_libc','pw_wine_sink','pw_audio_ring','pw_memory_helper','pw_memory_service','pw_wine_perf','pw_wine_cwd','pw_wine_cwd_libc','pw_wine_fdv','pw_wine_fdv_libc','pw_elfldr','pw_environment','pw_wine_vm','pw_wine_prefix','pw_wine_launch','pw_wine_window','pw_wine_pages','pw_wine_pages_ps5','pw_wine_blocks','pw_window_page','ntdll_desc')
  objects += [obj if n=='pw_wine_process' else dl_obj if n=='pw_wine_dl_libc' else desc_obj if n=='ntdll_desc' else base/'prx/obj'/f'{n}.o' for n in names]
  replaced={'pw_wine_dsection.o':dsection_obj,'pw_wine_dmap.o':dmap_obj}
  objects=[replaced.get(Path(o).name,o) for o in objects]
